@@ -183,23 +183,6 @@ export function nonStaticBodies(engine: Matter.Engine): Matter.Body[] {
   return Matter.Composite.allBodies(engine.world).filter((b) => !b.isStatic);
 }
 
-/** Remove the oldest non-static bodies (and their textures) beyond the cap. */
-export function enforceBodyCap(engine: Matter.Engine, render: Matter.Render): void {
-  const bodies = nonStaticBodies(engine);
-  const excess = bodies.length - MAX_BODIES;
-  for (let i = 0; i < excess; i++) {
-    releaseBodyTexture(render, bodies[i]);
-    Matter.Composite.remove(engine.world, bodies[i]);
-  }
-}
-
-export function clearBodies(engine: Matter.Engine, render: Matter.Render): void {
-  for (const body of nonStaticBodies(engine)) {
-    releaseBodyTexture(render, body);
-    Matter.Composite.remove(engine.world, body);
-  }
-}
-
 export function limitVelocity(bodies: Matter.Body[], max: number): void {
   for (const body of bodies) {
     const speed = body.speed;
@@ -609,6 +592,12 @@ export interface SoundEngine {
   snapshot(): void;
   blackHoleStart(): void;
   blackHoleStop(): void;
+  crack(intensity: number): void;
+  slowmo(on: boolean): void;
+  materialize(): void;
+  freeze(): void;
+  thaw(): void;
+  fireStart(): { stop(): void };
   debug(): { ctx: AudioContext | null; output: AudioNode | null; stats: Record<string, number> };
   dispose(): void;
 }
@@ -633,6 +622,7 @@ export function createSoundEngine(initialMuted: boolean): SoundEngine {
   let noiseBuf: AudioBuffer | null = null;
   let muted = initialMuted;
   let liveImpacts = 0;
+  let fireVoices = 0;
   const stats: Record<string, number> = {};
   // black-hole hum nodes
   let humOsc: OscillatorNode | null = null;
@@ -1171,6 +1161,200 @@ export function createSoundEngine(initialMuted: boolean): SoundEngine {
             /* ok */
           }
         }
+      };
+    },
+
+    crack(intensity: number) {
+      if (!ready()) return;
+      bump('crack');
+      const t = now();
+      const g = Math.max(0.15, Math.min(1, intensity));
+      // sharp high-passed noise snap
+      {
+        const src = noise();
+        const hp = ctx!.createBiquadFilter();
+        hp.type = 'highpass';
+        hp.frequency.value = 1800;
+        const gn = gainEnv(0.5 * g, 0.001, 0.09, t);
+        chain([src, hp, gn], t, t + 0.12);
+      }
+      // tiny crackle clicks
+      for (let i = 0; i < 3; i++) {
+        const dt = 0.04 + i * 0.05 + Math.random() * 0.02;
+        const src = noise();
+        const bp = ctx!.createBiquadFilter();
+        bp.type = 'bandpass';
+        bp.frequency.value = 2400 + Math.random() * 1800;
+        bp.Q.value = 2;
+        const gn = gainEnv(0.2 * g * (1 - i * 0.2), 0.001, 0.03, t + dt);
+        chain([src, bp, gn], t + dt, t + dt + 0.05);
+      }
+      // low thump
+      {
+        const o = osc('sine', 110);
+        o.frequency.setValueAtTime(110, t);
+        o.frequency.exponentialRampToValueAtTime(55, t + 0.12);
+        const gn = gainEnv(0.4 * g, 0.003, 0.15, t);
+        chain([o, gn], t, t + 0.18);
+      }
+    },
+
+    slowmo(on: boolean) {
+      if (!ready()) return;
+      bump('slowmo');
+      const t = now();
+      // deep whoosh: lowpass noise sweeps down in, up out
+      {
+        const src = noise();
+        const lp = ctx!.createBiquadFilter();
+        lp.type = 'lowpass';
+        lp.frequency.setValueAtTime(on ? 1600 : 250, t);
+        lp.frequency.exponentialRampToValueAtTime(on ? 250 : 1600, t + 0.35);
+        const gn = gainEnv(0.22, 0.01, 0.4, t);
+        chain([src, lp, gn], t, t + 0.45);
+      }
+      // pitch cue: sine drop / rise
+      {
+        const o = osc('sine', on ? 320 : 160);
+        o.frequency.setValueAtTime(on ? 320 : 160, t);
+        o.frequency.exponentialRampToValueAtTime(on ? 160 : 320, t + 0.3);
+        const gn = gainEnv(0.14, 0.01, 0.35, t);
+        chain([o, gn], t, t + 0.4);
+      }
+    },
+
+    materialize() {
+      if (!ready()) return;
+      bump('materialize');
+      const t = now();
+      // sparkly shimmer: quick ascending sine pings + tiny noise glint
+      const notes = [880, 1320, 1760];
+      for (let i = 0; i < notes.length; i++) {
+        const dt = i * 0.045;
+        const o = osc('sine', notes[i]);
+        const gn = gainEnv(0.08, 0.002, 0.09, t + dt);
+        chain([o, gn], t + dt, t + dt + 0.12);
+      }
+      {
+        const src = noise();
+        const hp = ctx!.createBiquadFilter();
+        hp.type = 'highpass';
+        hp.frequency.value = 5000;
+        const gn = gainEnv(0.05, 0.002, 0.1, t);
+        chain([src, hp, gn], t, t + 0.12);
+      }
+    },
+
+    freeze() {
+      if (!ready()) return;
+      bump('freeze');
+      const t = now();
+      // crystalline ting: high sine + harmonic, plus tiny crackle clicks
+      for (const f of [1850, 2780]) {
+        const o = osc('sine', f);
+        const gn = gainEnv(0.09, 0.002, 0.22, t);
+        chain([o, gn], t, t + 0.26);
+      }
+      for (let i = 0; i < 4; i++) {
+        const dt = 0.03 + i * 0.04 + Math.random() * 0.02;
+        const src = noise();
+        const bp = ctx!.createBiquadFilter();
+        bp.type = 'bandpass';
+        bp.frequency.value = 3000 + Math.random() * 2000;
+        bp.Q.value = 3;
+        const gn = gainEnv(0.08 * (1 - i * 0.18), 0.001, 0.025, t + dt);
+        chain([src, bp, gn], t + dt, t + dt + 0.04);
+      }
+    },
+
+    thaw() {
+      if (!ready()) return;
+      bump('thaw');
+      const t = now();
+      // drippy whoosh: descending blips + soft lowpass noise
+      for (let i = 0; i < 2; i++) {
+        const dt = i * 0.1;
+        const o = osc('sine', 700 - i * 200);
+        o.frequency.setValueAtTime(700 - i * 200, t + dt);
+        o.frequency.exponentialRampToValueAtTime(300 - i * 60, t + dt + 0.09);
+        const gn = gainEnv(0.09, 0.003, 0.09, t + dt);
+        chain([o, gn], t + dt, t + dt + 0.12);
+      }
+      {
+        const src = noise();
+        const lp = ctx!.createBiquadFilter();
+        lp.type = 'lowpass';
+        lp.frequency.setValueAtTime(500, t);
+        lp.frequency.exponentialRampToValueAtTime(1400, t + 0.3);
+        const gn = gainEnv(0.1, 0.01, 0.3, t);
+        chain([src, lp, gn], t, t + 0.35);
+      }
+    },
+
+    fireStart() {
+      const dead = { stop() {} };
+      if (!ready() || fireVoices >= 3) return dead;
+      bump('fireStart');
+      fireVoices += 1;
+      const t = now();
+      // crackle bed: looped noise → bandpass → wobbled gain → ambient bus
+      const src = noise();
+      const bp = ctx!.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = 1200;
+      bp.Q.value = 0.8;
+      const g = ctx!.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.13, t + 0.2);
+      // irregular crackle: square-ish LFO modulating a second noise band
+      const clicks = noise();
+      const hp = ctx!.createBiquadFilter();
+      hp.type = 'highpass';
+      hp.frequency.value = 2600;
+      const cg = ctx!.createGain();
+      cg.gain.value = 0.0001;
+      const lfo = osc('square', 9 + Math.random() * 5);
+      const lfoG = ctx!.createGain();
+      lfoG.gain.value = 0.05;
+      lfo.connect(lfoG);
+      lfoG.connect(cg.gain);
+      src.connect(bp);
+      bp.connect(g);
+      g.connect(ambientBus!);
+      clicks.connect(hp);
+      hp.connect(cg);
+      cg.connect(ambientBus!);
+      src.start(t);
+      clicks.start(t);
+      lfo.start(t);
+      let stopped = false;
+      return {
+        stop() {
+          if (stopped) return;
+          stopped = true;
+          fireVoices -= 1;
+          const t2 = now();
+          try {
+            g.gain.cancelScheduledValues(t2);
+            g.gain.setValueAtTime(Math.max(0.0001, g.gain.value), t2);
+            g.gain.exponentialRampToValueAtTime(0.0001, t2 + 0.3);
+            cg.gain.setValueAtTime(0.0001, t2);
+            lfo.stop(t2);
+            src.stop(t2 + 0.35);
+            clicks.stop(t2 + 0.35);
+            src.onended = () => {
+              for (const n of [src, bp, g, clicks, hp, cg, lfoG]) {
+                try {
+                  n.disconnect();
+                } catch {
+                  /* gone */
+                }
+              }
+            };
+          } catch {
+            /* ctx closed */
+          }
+        },
       };
     },
 

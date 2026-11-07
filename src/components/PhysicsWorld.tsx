@@ -5,13 +5,20 @@ import {
   ArrowLeft,
   ArrowRight,
   ArrowUp,
+  Anchor,
   Bomb,
   Camera,
+  Flame,
+  Hammer,
+  Hand,
+  Link,
   Orbit,
   Pause,
   Play,
   RotateCcw,
   Shapes,
+  Snowflake,
+  Timer,
   Trash2,
   Volume2,
   VolumeX,
@@ -24,7 +31,6 @@ import {
   BLACK_HOLE_LIFETIME,
   blackHoleRadius,
   clampBodiesInside,
-  clearBodies,
   computeBodySize,
   createEngine,
   createExplosionFx,
@@ -34,7 +40,6 @@ import {
   createTestObjects,
   createWalls,
   drawBodyTrails,
-  enforceBodyCap,
   explode,
   explosionOrigin,
   EXPLOSION_TRAIL_MS,
@@ -47,6 +52,7 @@ import {
   rasterizeTexture,
   readStoredMuted,
   registerTexture,
+  releaseBodyTexture,
   resizeRender,
   spawnPosition,
   stepAndDrawFx,
@@ -58,6 +64,33 @@ import {
   type MaterialName,
   type SoundEngine,
 } from '../lib/physics';
+import {
+  createObjectRegistry,
+  enforceObjectCap,
+  type ObjectRegistry,
+  type PhysObject,
+} from '../lib/physics/objects';
+import {
+  localTexture,
+  MAX_SHARDS,
+  shatterBody,
+  shardExpired,
+  tagShard,
+} from '../lib/physics/fracture';
+import {
+  createBurst,
+  createDustBurst,
+  createGlowRing,
+  createImpactDust,
+  createMaterializeFx,
+  stepAndDrawBursts,
+  stepAndDrawRings,
+  type ParticleBurst,
+  type RingFx,
+} from '../lib/physics/fx';
+import { createHullBody } from '../lib/physics/hull';
+import { createJelly, tintJellyTextures } from '../lib/physics/softbody';
+import { createRope, createSpringLink, drawRope, drawSpring } from '../lib/physics/ropes';
 import './PhysicsWorld.css';
 
 export interface PhysicsWorldProps {
@@ -81,17 +114,104 @@ const MOUSE_EVENTS: Array<[string, 'mousemove' | 'mousedown' | 'mouseup' | 'mous
   ['touchend', 'mouseup'],
 ];
 
+type ToolName = 'grab' | 'crumble' | 'freeze' | 'fire' | 'hang' | 'link' | 'blackhole';
+type SpawnKind = 'solid' | 'jelly';
+
+const TOOLS: Array<{ id: ToolName; label: string; icon: React.ReactNode }> = [
+  { id: 'grab', label: 'Grab', icon: <Hand size={16} /> },
+  { id: 'crumble', label: 'Crumble', icon: <Hammer size={16} /> },
+  { id: 'freeze', label: 'Freeze', icon: <Snowflake size={16} /> },
+  { id: 'fire', label: 'Fire', icon: <Flame size={16} /> },
+  { id: 'hang', label: 'Hang', icon: <Anchor size={16} /> },
+  { id: 'link', label: 'Link', icon: <Link size={16} /> },
+  { id: 'blackhole', label: 'Black Hole', icon: <Orbit size={16} /> },
+];
+
+const MAX_ROPES = 12;
+
+/** Engine-time burn duration (ms). */
+const BURN_MS = 3000;
+
+interface ScaleIn {
+  body: Matter.Body;
+  t0: number;
+  xs: number;
+  ys: number;
+}
+
+interface Burning {
+  obj: PhysObject;
+  t0: number;
+  voice: { stop(): void };
+}
+
 function addShowcase(
   engine: Matter.Engine,
   render: Matter.Render,
   w: number,
   h: number,
   material: MaterialName,
+  registry: ObjectRegistry,
+  spawnAs: SpawnKind,
+  spawnFx?: (body: Matter.Body, opts?: { sound?: boolean }) => void,
 ): void {
   for (const item of createTestObjects(w, h)) {
+    if (spawnAs === 'jelly') {
+      const body = item.body;
+      const local = body.vertices.map((v) => ({
+        x: v.x - body.position.x,
+        y: v.y - body.position.y,
+      }));
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      for (const v of local) {
+        if (v.x < minX) minX = v.x;
+        if (v.y < minY) minY = v.y;
+        if (v.x > maxX) maxX = v.x;
+        if (v.y > maxY) maxY = v.y;
+      }
+      const bw = maxX - minX;
+      const bh = maxY - minY;
+      const tex = item.texture
+        ? item.texture.canvas
+        : localTexture(body, render, local, bw, bh);
+      const jelly = createJelly({
+        x: body.position.x,
+        y: body.position.y,
+        w: bw,
+        h: bh,
+        texture: tex,
+        render,
+        material,
+      });
+      if (jelly) {
+        registry.add(engine.world, {
+          id: registry.nextId(),
+          kind: 'jelly',
+          root: jelly.root,
+          bodies: jelly.bodies,
+          constraints: jelly.constraints,
+          textureKeys: jelly.textureKeys,
+          createdAt: engine.timing.timestamp,
+        });
+        spawnFx?.(jelly.root, { sound: false });
+        continue;
+      }
+    }
     if (item.texture) registerTexture(render, item.texture.key, item.texture.canvas);
     applyMaterial(item.body, material);
-    Matter.Composite.add(engine.world, item.body);
+    spawnFx?.(item.body, { sound: false });
+    registry.add(engine.world, {
+      id: registry.nextId(),
+      kind: 'solid',
+      root: item.body,
+      bodies: [item.body],
+      constraints: [],
+      textureKeys: item.texture ? [item.texture.key] : [],
+      createdAt: engine.timing.timestamp,
+    });
   }
 }
 
@@ -108,8 +228,25 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
   const materialRef = useRef<MaterialName>('normal');
   const selectedBodyRef = useRef<Matter.Body | null>(null);
   const blackHoleRef = useRef<BlackHole | null>(null);
-  const blackHoleArmedRef = useRef(false);
-  const savedMaskRef = useRef<number | undefined>(undefined);
+  const registryRef = useRef<ObjectRegistry | null>(null);
+  const toolRef = useRef<ToolName>('grab');
+  const defaultMaskRef = useRef<number>(-1);
+  const shatterQueueRef = useRef<Set<number>>(new Set());
+  const dustBurstsRef = useRef<ParticleBurst[]>([]);
+  const ringsRef = useRef<RingFx[]>([]);
+  const flamesRef = useRef<ParticleBurst[]>([]);
+  const scaleInsRef = useRef<ScaleIn[]>([]);
+  const burningRef = useRef<Burning[]>([]);
+  const dustTimesRef = useRef<number[]>([]);
+  const fragileRef = useRef(false);
+  const explodeShatterRef = useRef(false);
+  const spawnAsRef = useRef<SpawnKind>('solid');
+  const pendingLinkRef = useRef<{
+    obj: PhysObject;
+    body: Matter.Body;
+    point: { x: number; y: number };
+    angle: number;
+  } | null>(null);
   const soundRef = useRef<SoundEngine | null>(null);
   const fxListRef = useRef<ExplosionFx[]>([]);
   const trailUntilRef = useRef(0);
@@ -122,7 +259,11 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
   const [gravityDir, setGravityDir] = useState<GravityDirection>('down');
   const [gravityStrength, setGravityStrength] = useState(1);
   const [material, setMaterial] = useState<MaterialName>('normal');
-  const [blackHoleArmed, setBlackHoleArmed] = useState(false);
+  const [tool, setToolState] = useState<ToolName>('grab');
+  const [fragile, setFragile] = useState(false);
+  const [explodeShatter, setExplodeShatter] = useState(false);
+  const [slowMo, setSlowMo] = useState(false);
+  const [spawnAs, setSpawnAs] = useState<SpawnKind>('solid');
   const [muted, setMuted] = useState(readStoredMuted);
   const [fxKey, setFxKey] = useState(0);
   const [fxReduced, setFxReduced] = useState(false);
@@ -133,8 +274,8 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
   const [snapKey, setSnapKey] = useState(0);
 
   const updateCount = useCallback(() => {
-    const engine = engineRef.current;
-    if (engine) setObjectCount(nonStaticBodies(engine).length);
+    const registry = registryRef.current;
+    if (registry) setObjectCount(registry.size);
   }, []);
 
   /** Clear the selection if its body is no longer in the world. */
@@ -146,15 +287,135 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
     }
   }, []);
 
-  const disarmBlackHole = useCallback(() => {
-    blackHoleArmedRef.current = false;
-    setBlackHoleArmed(false);
+  const setTool = useCallback((t: ToolName) => {
+    toolRef.current = t;
+    setToolState(t);
+    pendingLinkRef.current = null;
     const mc = mouseConstraintRef.current;
-    if (mc && savedMaskRef.current !== undefined) {
-      mc.collisionFilter.mask = savedMaskRef.current;
-      savedMaskRef.current = undefined;
+    if (mc) {
+      mc.collisionFilter.mask = t === 'grab' ? defaultMaskRef.current : 0;
     }
   }, []);
+
+  /** Shatter a solid object: shards to world, object out, dust + crack. */
+  const shatterObject = useCallback(
+    (
+      obj: PhysObject,
+      impact: { x: number; y: number },
+      shardCount?: number,
+      opts?: { sound?: boolean; dust?: boolean; count?: boolean; tint?: 'ice' | 'ash' | null },
+    ) => {
+      const engine = engineRef.current;
+      const render = renderRef.current;
+      const registry = registryRef.current;
+      if (!engine || !render || !registry || obj.kind !== 'solid') return;
+      const frozen = (obj.root.plugin as Record<string, unknown> | undefined)?.frozen === true;
+      const shards = shatterBody(obj.root, {
+        world: engine.world,
+        render,
+        impact,
+        shardCount,
+        tint: opts?.tint !== undefined ? opts.tint : frozen ? 'ice' : null,
+      });
+      registry.remove(engine.world, render, obj);
+      const now = engine.timing.timestamp;
+      for (const s of shards) {
+        tagShard(s, now);
+        Matter.Composite.add(engine.world, s);
+      }
+      // shard cap: remove oldest beyond MAX_SHARDS
+      const shardBodies = nonStaticBodies(engine).filter(
+        (b) => (b.plugin as Record<string, unknown> | undefined)?.shard,
+      );
+      for (let i = 0; i < shardBodies.length - MAX_SHARDS; i++) {
+        releaseBodyTexture(render, shardBodies[i]);
+        Matter.Composite.remove(engine.world, shardBodies[i]);
+      }
+      if (opts?.dust !== false) dustBurstsRef.current.push(createDustBurst(impact.x, impact.y, opts?.tint ?? (frozen ? 'ice' : null)));
+      if (opts?.sound !== false) soundRef.current?.crack(0.8);
+      if (selectedBodyRef.current && obj.bodies.includes(selectedBodyRef.current)) {
+        selectedBodyRef.current = null;
+      }
+      if (opts?.count !== false) updateCount();
+    },
+    [updateCount],
+  );
+
+  /** Dissolve a composite object (jelly): drop springs/registry entry but keep
+   *  the bodies in the world as shards. */
+  const dissolveObject = useCallback(
+    (
+      obj: PhysObject,
+      impact: { x: number; y: number },
+      opts?: { sound?: boolean; dust?: boolean; count?: boolean; tint?: 'ice' | 'ash' | null },
+    ) => {
+      const engine = engineRef.current;
+      const render = renderRef.current;
+      const registry = registryRef.current;
+      if (!engine || !render || !registry || obj.kind === 'solid') return;
+      const frozen = (obj.root.plugin as Record<string, unknown> | undefined)?.frozen === true;
+      const tint = opts?.tint !== undefined ? opts.tint : frozen ? 'ice' : null;
+      if (tint) tintJellyTextures(obj, render, tint);
+      registry.drop(engine.world, obj);
+      const now = engine.timing.timestamp;
+      for (const b of obj.bodies) {
+        b.collisionFilter.group = 0;
+        Matter.Body.setStatic(b, false);
+        tagShard(b, now);
+        (b.plugin as Record<string, unknown>).shard = true;
+      }
+      // shard cap: remove oldest beyond MAX_SHARDS
+      const shardBodies = nonStaticBodies(engine).filter(
+        (b) => (b.plugin as Record<string, unknown> | undefined)?.shard,
+      );
+      for (let i = 0; i < shardBodies.length - MAX_SHARDS; i++) {
+        releaseBodyTexture(render, shardBodies[i]);
+        Matter.Composite.remove(engine.world, shardBodies[i]);
+      }
+      if (opts?.dust !== false) dustBurstsRef.current.push(createDustBurst(impact.x, impact.y, tint));
+      if (opts?.sound !== false) soundRef.current?.crack(0.8);
+      if (selectedBodyRef.current && obj.bodies.includes(selectedBodyRef.current)) {
+        selectedBodyRef.current = null;
+      }
+      if (opts?.count !== false) updateCount();
+    },
+    [updateCount],
+  );
+
+  /** Crumble entry point: solids shatter, composites dissolve. */
+  const crumbleObject = useCallback(
+    (
+      obj: PhysObject,
+      impact: { x: number; y: number },
+      shardCount?: number,
+      opts?: { sound?: boolean; dust?: boolean; count?: boolean; tint?: 'ice' | 'ash' | null },
+    ) => {
+      if (obj.kind === 'solid') shatterObject(obj, impact, shardCount, opts);
+      else dissolveObject(obj, impact, opts);
+    },
+    [shatterObject, dissolveObject],
+  );
+
+  /** Materialize feedback for a newly spawned body (ring + sparkles + scale-in). */
+  const spawnFx = useCallback((body: Matter.Body, opts?: { sound?: boolean }) => {
+    ringsRef.current.push(createGlowRing(body.position.x, body.position.y));
+    dustBurstsRef.current.push(createMaterializeFx(body.position.x, body.position.y));
+    const sp = body.render.sprite;
+    scaleInsRef.current.push({
+      body,
+      t0: performance.now(),
+      xs: sp?.xScale ?? 1,
+      ys: sp?.yScale ?? 1,
+    });
+    body.render.opacity = 0;
+    if (opts?.sound !== false) soundRef.current?.materialize();
+  }, []);
+
+  // effect-stable access without making the mount effect depend on callbacks
+  const actionsRef = useRef({ crumbleObject, setTool });
+  useEffect(() => {
+    actionsRef.current = { crumbleObject, setTool };
+  });
 
   // --- Engine lifecycle (runs once per mount; StrictMode-safe) ---------------
   useEffect(() => {
@@ -192,7 +453,17 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
 
     const runner = Matter.Runner.create();
     const sound = createSoundEngine(readStoredMuted());
+    const registry = createObjectRegistry();
     soundRef.current = sound;
+    registryRef.current = registry;
+    defaultMaskRef.current = mouseConstraint.collisionFilter.mask ?? -1;
+    const dustBursts = dustBurstsRef.current;
+    const rings = ringsRef.current;
+    const flames = flamesRef.current;
+    const scaleIns = scaleInsRef.current;
+    const burning = burningRef.current;
+    const dustTimes = dustTimesRef.current;
+    const shatterQueue = shatterQueueRef.current;
     const fxList = fxListRef.current;
 
     engineRef.current = engine;
@@ -216,7 +487,35 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
 
     const onBeforeUpdate = () => {
       const bodies = nonStaticBodies(engine);
-      for (const b of bodies) preVel.set(b, { x: b.velocity.x, y: b.velocity.y });
+      for (const b of bodies) {
+        preVel.set(b, { x: b.velocity.x, y: b.velocity.y });
+        // shard lifecycle: fade last 1.5s of life, remove + release texture
+        if (shardExpired(b, engine.timing.timestamp)) {
+          releaseBodyTexture(render, b);
+          Matter.Composite.remove(engine.world, b);
+        }
+      }
+      // burning objects: engine-time progress, then crumble to ash
+      if (burning.length > 0) {
+        const ts = engine.timing.timestamp;
+        for (let i = burning.length - 1; i >= 0; i--) {
+          const e = burning[i];
+          if (registry.objectOf(e.obj.root) !== e.obj) {
+            e.voice.stop();
+            burning.splice(i, 1);
+            continue;
+          }
+          if (ts - e.t0 >= BURN_MS) {
+            e.voice.stop();
+            burning.splice(i, 1);
+            const c = e.obj.root.position;
+            actionsRef.current.crumbleObject(e.obj, { x: c.x, y: c.y }, undefined, {
+              tint: 'ash',
+            });
+            dustBursts.push(createDustBurst(c.x, c.y, 'ash'));
+          }
+        }
+      }
       const hole = blackHoleRef.current;
       if (hole) {
         if (engine.timing.timestamp - hole.bornAt > BLACK_HOLE_LIFETIME) {
@@ -241,6 +540,45 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
         const n = pair.collision.normal;
         const relSpeed = Math.abs((va.x - vb.x) * n.x + (va.y - vb.y) * n.y);
         if (relSpeed < 1.2) continue;
+        // fragile: hard hits queue a crumble BEFORE the sound cooldown
+        if (fragileRef.current && relSpeed > 10) {
+          for (const body of [a, b]) {
+            if (body.isStatic) continue;
+            const obj = registry.objectOf(body);
+            if (obj && obj.kind === 'solid') shatterQueue.add(obj.id);
+          }
+        }
+        // brittle: frozen bodies shatter on hard hits even with Fragile off
+        if (relSpeed > 12) {
+          for (const body of [a, b]) {
+            if (!((body.plugin as Record<string, unknown> | undefined)?.frozen)) continue;
+            const obj = registry.objectOf(body);
+            if (obj && obj.kind === 'solid') shatterQueue.add(obj.id);
+          }
+        }
+        // impact dust at the contact point, rate-limited to ~12 bursts/s;
+        // shard hits only 1-in-4
+        if (relSpeed > 4) {
+          const shardHit =
+            (a.plugin as Record<string, unknown> | undefined)?.shard ||
+            (b.plugin as Record<string, unknown> | undefined)?.shard;
+          if (!shardHit || Math.random() < 0.25) {
+            while (dustTimes.length > 0 && tNow - dustTimes[0] > 1000) dustTimes.shift();
+            if (dustTimes.length < 12) {
+              dustTimes.push(tNow);
+              const sup = pair.collision.supports;
+              const supportCount = (pair.collision as { supportCount?: number }).supportCount;
+              const n2 = Math.min(supportCount || sup.length, sup.length);
+              let sx = 0;
+              let sy = 0;
+              for (let i = 0; i < n2; i++) {
+                sx += sup[i].x;
+                sy += sup[i].y;
+              }
+              dustBursts.push(createImpactDust(sx / n2, sy / n2));
+            }
+          }
+        }
         const moving = a.isStatic ? b : b.isStatic ? a : a.speed >= b.speed ? a : b;
         const last = lastImpactAt.get(moving) || 0;
         if (tNow - last < 80) continue;
@@ -262,7 +600,20 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
       }
     };
     const onAfterUpdate = () => {
-      if (blackHoleArmedRef.current) {
+      // process queued crumbles (fragile impacts) — deduped by object id
+      if (shatterQueue.size > 0) {
+        const ids = new Set(shatterQueue);
+        shatterQueue.clear();
+        for (const obj of registry.list()) {
+          if (ids.has(obj.id)) {
+            actionsRef.current.crumbleObject(obj, {
+              x: obj.root.position.x + (Math.random() - 0.5) * 20,
+              y: obj.root.position.y + (Math.random() - 0.5) * 20,
+            });
+          }
+        }
+      }
+      if (toolRef.current !== 'grab') {
         setCursor('crosshair');
       } else if (mouseConstraint.body) {
         setCursor('grabbing');
@@ -288,27 +639,152 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
         sound.throwWhoosh(Math.min(1, body.speed / 25));
       }
     };
-    const onMouseDown = () => {
-      if (blackHoleArmedRef.current) {
-        blackHoleRef.current = {
-          x: mouse.position.x,
-          y: mouse.position.y,
-          bornAt: engine.timing.timestamp,
-        };
+    Matter.Events.on(mouseConstraint, 'startdrag', onStartDrag);
+    Matter.Events.on(mouseConstraint, 'enddrag', onEndDrag);
+
+    // tool clicks — own DOM listener registered AFTER Mouse.create so
+    // mouse.position is already updated; works while paused (unlike the
+    // MouseConstraint 'mousedown' event which fires inside engine updates)
+    const onCanvasMouseDown = () => {
+      const tool = toolRef.current;
+      const pos = { x: mouse.position.x, y: mouse.position.y };
+      if (tool === 'blackhole') {
+        blackHoleRef.current = { x: pos.x, y: pos.y, bornAt: engine.timing.timestamp };
         sound.blackHoleStart();
-        blackHoleArmedRef.current = false;
-        setBlackHoleArmed(false);
-        if (savedMaskRef.current !== undefined) {
-          mouseConstraint.collisionFilter.mask = savedMaskRef.current;
-          savedMaskRef.current = undefined;
+        return;
+      }
+      if (tool === 'crumble') {
+        const hit = Matter.Query.point(registry.allBodies(), pos)[0];
+        if (hit) {
+          const obj = registry.objectOf(hit);
+          if (obj) actionsRef.current.crumbleObject(obj, pos);
         }
-      } else if (Matter.Query.point(nonStaticBodies(engine), mouse.position).length === 0) {
+        return;
+      }
+      if (tool === 'freeze') {
+        const hit = Matter.Query.point(registry.allBodies(), pos)[0];
+        if (hit) {
+          const obj = registry.objectOf(hit);
+          if (obj) {
+            const frozen = (obj.root.plugin as Record<string, unknown>).frozen === true;
+            for (const b of obj.bodies) {
+              Matter.Body.setStatic(b, !frozen);
+              if (frozen) delete (b.plugin as Record<string, unknown>).frozen;
+              else (b.plugin as Record<string, unknown>).frozen = true;
+            }
+            if (frozen) sound.thaw();
+            else sound.freeze();
+          }
+        }
+        return;
+      }
+      if (tool === 'fire') {
+        const hit = Matter.Query.point(registry.allBodies(), pos)[0];
+        if (hit) {
+          const obj = registry.objectOf(hit);
+          if (obj) {
+            if ((obj.root.plugin as Record<string, unknown>).frozen === true) {
+              for (const b of obj.bodies) {
+                Matter.Body.setStatic(b, false);
+                delete (b.plugin as Record<string, unknown>).frozen;
+              }
+              dustBursts.push(createDustBurst(pos.x, pos.y, 'ice'));
+              sound.thaw();
+            } else if (!burning.some((e) => e.obj === obj)) {
+              burning.push({ obj, t0: engine.timing.timestamp, voice: sound.fireStart() });
+            }
+          }
+        }
+        return;
+      }
+      if (tool === 'hang') {
+        const hit = Matter.Query.point(registry.allBodies(), pos)[0];
+        if (hit) {
+          const obj = registry.objectOf(hit);
+          if (obj) {
+            // anchor on the stage edge opposite gravity
+            const g = engine.gravity;
+            const cw = render.options.width || 800;
+            const ch = render.options.height || 600;
+            const anchor =
+              Math.abs(g.y) >= Math.abs(g.x)
+                ? { x: pos.x, y: g.y > 0 ? 8 : ch - 8 }
+                : { x: g.x > 0 ? 8 : cw - 8, y: pos.y };
+            const { bodies: rb, constraints: rc } = createRope(anchor, pos, hit);
+            registry.attach(engine.world, {
+              id: registry.nextId(),
+              kind: 'rope',
+              objectIds: [obj.id],
+              bodies: rb,
+              constraints: rc,
+              anchor,
+            });
+            const ropes = registry.attachments().filter((a) => a.kind === 'rope');
+            for (let i = 0; i < ropes.length - MAX_ROPES; i++) {
+              registry.detach(engine.world, ropes[i]);
+            }
+            sound.click();
+          }
+        }
+        return;
+      }
+      if (tool === 'link') {
+        const hit = Matter.Query.point(registry.allBodies(), pos)[0];
+        const pending = pendingLinkRef.current;
+        if (!hit) {
+          pendingLinkRef.current = null;
+          return;
+        }
+        const obj = registry.objectOf(hit);
+        if (!obj) return;
+        if (!pending) {
+          pendingLinkRef.current = {
+            obj,
+            body: hit,
+            point: { x: pos.x - hit.position.x, y: pos.y - hit.position.y },
+            angle: hit.angle,
+          };
+          sound.click();
+          return;
+        }
+        if (pending.obj === obj) {
+          pendingLinkRef.current = null;
+          return;
+        }
+        const pointB = { x: pos.x - hit.position.x, y: pos.y - hit.position.y };
+        // A may have turned since it was picked: rotate its world-frame offset along
+        const da = pending.body.angle - pending.angle;
+        const pointA = {
+          x: pending.point.x * Math.cos(da) - pending.point.y * Math.sin(da),
+          y: pending.point.x * Math.sin(da) + pending.point.y * Math.cos(da),
+        };
+        const c = createSpringLink(pending.body, hit, pointA, pointB);
+        registry.attach(engine.world, {
+          id: registry.nextId(),
+          kind: 'spring',
+          objectIds: [pending.obj.id, obj.id],
+          bodies: [],
+          constraints: [c],
+        });
+        pendingLinkRef.current = null;
+        sound.click();
+        return;
+      }
+      // grab tool: deselect on empty-canvas click
+      if (Matter.Query.point(registry.allBodies(), pos).length === 0) {
         selectedBodyRef.current = null;
       }
     };
-    Matter.Events.on(mouseConstraint, 'startdrag', onStartDrag);
-    Matter.Events.on(mouseConstraint, 'enddrag', onEndDrag);
-    Matter.Events.on(mouseConstraint, 'mousedown', onMouseDown);
+    render.canvas.addEventListener('mousedown', onCanvasMouseDown);
+    render.canvas.addEventListener('touchstart', onCanvasMouseDown);
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA')) return;
+      actionsRef.current.setTool('grab');
+    };
+    window.addEventListener('keydown', onKeyDown);
 
     let lastFrameT = performance.now();
     const fxMsLog: number[] = [];
@@ -323,13 +799,161 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
 
       // explosion FX: body trails then particles (composited with bodies,
       // captured by snapshots)
+      const sdtMs = dtMs * (engine.timing.timeScale || 1);
       const fxT0 = performance.now();
+      if (dustBursts.length > 0) {
+        stepAndDrawBursts(ctx, dustBursts, sdtMs, engine.gravity);
+      }
+      if (flames.length > 0) {
+        stepAndDrawBursts(ctx, flames, sdtMs, engine.gravity);
+      }
+      if (rings.length > 0) {
+        stepAndDrawRings(ctx, rings, sdtMs);
+      }
       const trailLeft = trailUntilRef.current - frameT;
       if (trailLeft > 0) {
         drawBodyTrails(ctx, nonStaticBodies(engine), Math.min(1, trailLeft / EXPLOSION_TRAIL_MS));
       }
       if (fxList.length > 0) {
-        stepAndDrawFx(ctx, fxList, dtMs, engine.gravity);
+        stepAndDrawFx(ctx, fxList, sdtMs, engine.gravity);
+      }
+      // scale-ins + fade-ins (real time; drop entries whose body is gone)
+      if (scaleIns.length > 0) {
+        const worldBodies = Matter.Composite.allBodies(engine.world);
+        for (let i = scaleIns.length - 1; i >= 0; i--) {
+          const e = scaleIns[i];
+          if (!worldBodies.includes(e.body)) {
+            scaleIns.splice(i, 1);
+            continue;
+          }
+          const t = Math.min(1, (frameT - e.t0) / 250);
+          const c1 = 1.70158;
+          const k = 1 + (c1 + 1) * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); // easeOutBack
+          const sp = e.body.render.sprite;
+          if (sp) {
+            sp.xScale = e.xs * (0.3 + 0.7 * k);
+            sp.yScale = e.ys * (0.3 + 0.7 * k);
+          }
+          e.body.render.opacity = Math.min(1, (frameT - e.t0) / 200);
+          if (t >= 1) {
+            if (sp) {
+              sp.xScale = e.xs;
+              sp.yScale = e.ys;
+            }
+            e.body.render.opacity = 1;
+            scaleIns.splice(i, 1);
+          }
+        }
+      }
+      // flame emission (paused -> no new flames); cap ~300 particles
+      if (runner.enabled && burning.length > 0) {
+        let flameCount = 0;
+        for (const b of flames) flameCount += b.particles.length;
+        for (const e of burning) {
+          if (flameCount > 300) break;
+          // spawn points biased to the anti-gravity side of every tile
+          const bodies2 = e.obj.bodies;
+          const bb = bodies2[(Math.random() * bodies2.length) | 0];
+          const verts = bb.vertices;
+          const g = engine.gravity;
+          let v = verts[(Math.random() * verts.length) | 0];
+          for (let i = 0; i < 3; i++) {
+            const c2 = verts[(Math.random() * verts.length) | 0];
+            if ((c2.x - bb.position.x) * -g.x + (c2.y - bb.position.y) * -g.y >
+                (v.x - bb.position.x) * -g.x + (v.y - bb.position.y) * -g.y) v = c2;
+          }
+          const b2 = createBurst(v.x, v.y, {
+            count: 3 + ((Math.random() * 2) | 0),
+            colors: ['rgba(255,140,20,0.9)', 'rgba(255,90,10,0.85)', 'rgba(255,200,60,0.9)'],
+            speedMin: 40,
+            speedMax: 120,
+            dirAngle: Math.atan2(-g.y, -g.x || 0.001),
+            spread: 0.55,
+            r0: [4, 9],
+            r1: [0, 2],
+            life: [400, 900],
+            drag: 2,
+            additive: true,
+          });
+          flameCount += b2.particles.length;
+          flames.push(b2);
+          if (Math.random() < 0.12) {
+            const emb = createBurst(v.x, v.y, {
+              count: 1,
+              colors: ['rgba(255,240,180,0.95)'],
+              speedMin: 60,
+              speedMax: 160,
+              dirAngle: Math.atan2(-g.y, -g.x || 0.001),
+              spread: 1.2,
+              r0: [1, 2],
+              r1: [0, 0.5],
+              life: [700, 1200],
+              drag: 1.2,
+              additive: true,
+            });
+            flameCount += emb.particles.length;
+            flames.push(emb);
+          }
+        }
+      }
+      // icy overlay on frozen bodies + burn overlay
+      {
+        const ts = engine.timing.timestamp;
+        for (const b of registry.allBodies()) {
+          if (!((b.plugin as Record<string, unknown> | undefined)?.frozen)) continue;
+          const verts = b.vertices;
+          ctx.beginPath();
+          ctx.moveTo(verts[0].x, verts[0].y);
+          for (let i = 1; i < verts.length; i++) ctx.lineTo(verts[i].x, verts[i].y);
+          ctx.closePath();
+          ctx.fillStyle = 'rgba(160, 215, 255, 0.45)';
+          ctx.fill();
+          ctx.save();
+          ctx.shadowColor = 'rgba(140, 210, 255, 0.9)';
+          ctx.shadowBlur = 12;
+          ctx.strokeStyle = 'rgba(200, 238, 255, 0.95)';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+          ctx.restore();
+          // 4-point sparkle glints at a few vertices
+          ctx.strokeStyle = 'rgba(240, 250, 255, 0.9)';
+          ctx.lineWidth = 1.2;
+          const glints = Math.min(4, Math.max(3, verts.length >> 1));
+          for (let i = 0; i < glints; i++) {
+            const v = verts[(i * 2) % verts.length];
+            ctx.beginPath();
+            ctx.moveTo(v.x - 5, v.y);
+            ctx.lineTo(v.x + 5, v.y);
+            ctx.moveTo(v.x, v.y - 5);
+            ctx.lineTo(v.x, v.y + 5);
+            ctx.stroke();
+          }
+        }
+        for (const e of burning) {
+          const p = Math.min(1, (ts - e.t0) / BURN_MS);
+          for (const bb of e.obj.bodies) {
+            const verts = bb.vertices;
+            ctx.beginPath();
+            ctx.moveTo(verts[0].x, verts[0].y);
+            for (let i = 1; i < verts.length; i++) ctx.lineTo(verts[i].x, verts[i].y);
+            ctx.closePath();
+            ctx.fillStyle = 'rgba(10, 6, 4, ' + (0.55 * p).toFixed(3) + ')';
+            ctx.fill();
+          }
+          const verts = e.obj.root.vertices;
+          ctx.beginPath();
+          ctx.moveTo(verts[0].x, verts[0].y);
+          for (let i = 1; i < verts.length; i++) ctx.lineTo(verts[i].x, verts[i].y);
+          ctx.closePath();
+          ctx.save();
+          ctx.shadowColor = 'rgba(255, 120, 20, 0.9)';
+          ctx.shadowBlur = 10;
+          ctx.strokeStyle =
+            'rgba(255, ' + Math.round(160 - 80 * p) + ', 30, ' + (0.4 + 0.6 * p).toFixed(3) + ')';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+          ctx.restore();
+        }
       }
       if (import.meta.env.DEV) {
         fxMsLog.push(performance.now() - fxT0);
@@ -377,6 +1001,30 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
         ctx.globalAlpha = 1;
       }
 
+      // attachments: ropes + link springs
+      for (const att of registry.attachments()) {
+        if (att.kind === 'rope') drawRope(ctx, att);
+        else drawSpring(ctx, att);
+      }
+      // pending link pick: pulsing outline on A
+      {
+        const pend = pendingLinkRef.current;
+        if (pend && registry.objectOf(pend.body)) {
+          const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 160);
+          const verts = pend.body.vertices;
+          ctx.beginPath();
+          ctx.moveTo(verts[0].x, verts[0].y);
+          for (let i = 1; i < verts.length; i++) ctx.lineTo(verts[i].x, verts[i].y);
+          ctx.closePath();
+          ctx.save();
+          ctx.shadowColor = 'rgba(34, 211, 238, 0.9)';
+          ctx.shadowBlur = 10;
+          ctx.strokeStyle = 'rgba(34, 211, 238, ' + (0.4 + 0.5 * pulse).toFixed(3) + ')';
+          ctx.lineWidth = 2.5;
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
       // selected body outline
       const sel = selectedBodyRef.current;
       if (sel && Matter.Composite.allBodies(engine.world).includes(sel)) {
@@ -419,8 +1067,8 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
     Matter.Runner.run(runner, engine);
     Matter.Render.run(render);
 
-    addShowcase(engine, render, w, h, materialRef.current);
-    setObjectCount(nonStaticBodies(engine).length);
+    addShowcase(engine, render, w, h, materialRef.current, registry, spawnAsRef.current);
+    setObjectCount(registry.size);
 
     // debug hook for automated verification
     if (import.meta.env.DEV) {
@@ -428,11 +1076,12 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
         engine,
         render,
         runner,
-        refs: { blackHoleRef, selectedBodyRef, materialRef },
+        refs: { blackHoleRef, selectedBodyRef, materialRef, burningRef, scaleInsRef },
         mouseConstraint,
         sound,
         fxMsLog,
         fxList: fxListRef,
+        registry,
       };
     }
 
@@ -470,8 +1119,17 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
       soundRef.current = null;
       selectedBodyRef.current = null;
       blackHoleRef.current = null;
-      blackHoleArmedRef.current = false;
-      savedMaskRef.current = undefined;
+      render.canvas.removeEventListener('mousedown', onCanvasMouseDown);
+      render.canvas.removeEventListener('touchstart', onCanvasMouseDown);
+      window.removeEventListener('keydown', onKeyDown);
+      for (const e of burning) e.voice.stop();
+      burning.length = 0;
+      flames.length = 0;
+      rings.length = 0;
+      scaleIns.length = 0;
+      dustBursts.length = 0;
+      shatterQueue.clear();
+      registryRef.current = null;
     };
   }, []);
 
@@ -479,7 +1137,8 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
   useEffect(() => {
     const engine = engineRef.current;
     const render = renderRef.current;
-    if (!engine || !render) return;
+    const registry = registryRef.current;
+    if (!engine || !render || !registry) return;
 
     for (const request of spawnRequests) {
       if (processedIdsRef.current.has(request.id)) continue;
@@ -493,16 +1152,53 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
         const ch = render.options.height || 600;
         const size = computeBodySize(request, img.naturalWidth, img.naturalHeight, cw, ch);
         const texture = rasterizeTexture(img, size.width, size.height);
+        const pos = spawnPosition(cw, ch, size.height);
+        if (spawnAsRef.current === 'jelly') {
+          const jelly = createJelly({
+            x: pos.x,
+            y: pos.y,
+            w: size.width,
+            h: size.height,
+            texture,
+            render,
+            material: materialRef.current,
+          });
+          if (jelly) {
+            registry.add(engine.world, {
+              id: registry.nextId(),
+              kind: 'jelly',
+              root: jelly.root,
+              bodies: jelly.bodies,
+              constraints: jelly.constraints,
+              textureKeys: jelly.textureKeys,
+              createdAt: engine.timing.timestamp,
+            });
+            spawnFx(jelly.root);
+            enforceObjectCap(registry, engine.world, render);
+            syncSelection();
+            updateCount();
+            return;
+          }
+        }
         const key = textureKey(request.id);
         registerTexture(render, key, texture);
-        const pos = spawnPosition(cw, ch, size.height);
-        const body = createImageBody(pos.x, pos.y, size.width, size.height, key, texture);
+        const body =
+          createHullBody(pos.x, pos.y, size.width, size.height, key, texture) ??
+          createImageBody(pos.x, pos.y, size.width, size.height, key, texture);
         applyMaterial(body, materialRef.current);
         Matter.Body.setAngle(body, (Math.random() - 0.5) * 0.6);
         Matter.Body.setAngularVelocity(body, (Math.random() - 0.5) * 0.15);
-        Matter.Composite.add(engine.world, body);
-        soundRef.current?.spawn();
-        enforceBodyCap(engine, render);
+        registry.add(engine.world, {
+          id: registry.nextId(),
+          kind: 'solid',
+          root: body,
+          bodies: [body],
+          constraints: [],
+          textureKeys: [key],
+          createdAt: engine.timing.timestamp,
+        });
+        spawnFx(body);
+        enforceObjectCap(registry, engine.world, render);
         syncSelection();
         updateCount();
       };
@@ -515,15 +1211,24 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
         const body = createPlaceholderBody(pos.x, pos.y, size.width, size.height);
         applyMaterial(body, materialRef.current);
         Matter.Body.setAngle(body, (Math.random() - 0.5) * 0.6);
-        Matter.Composite.add(engine.world, body);
+        registry.add(engine.world, {
+          id: registry.nextId(),
+          kind: 'solid',
+          root: body,
+          bodies: [body],
+          constraints: [],
+          textureKeys: [],
+          createdAt: engine.timing.timestamp,
+        });
         soundRef.current?.spawn();
-        enforceBodyCap(engine, render);
+        spawnFx(body);
+        enforceObjectCap(registry, engine.world, render);
         syncSelection();
         updateCount();
       };
       img.src = request.url;
     }
-  }, [spawnRequests, updateCount, syncSelection]);
+  }, [spawnRequests, updateCount, syncSelection, spawnFx]);
 
   // --- Gravity ----------------------------------------------------------------
   useEffect(() => {
@@ -562,12 +1267,31 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
     setPaused(next);
   }, [paused]);
 
+  const toggleSlowMo = useCallback(() => {
+    const engine = engineRef.current;
+    if (!engine) return;
+    const next = !slowMo;
+    engine.timing.timeScale = next ? 0.25 : 1;
+    soundRef.current?.slowmo(next);
+    setSlowMo(next);
+  }, [slowMo]);
+
   const handleClear = useCallback(() => {
     const engine = engineRef.current;
     const render = renderRef.current;
     if (!engine || !render) return;
+    const registry = registryRef.current;
+    if (!registry) return;
     clearGenerationRef.current += 1;
-    clearBodies(engine, render);
+    registry.removeAll(engine.world, render);
+    for (const b of nonStaticBodies(engine)) {
+      releaseBodyTexture(render, b);
+      Matter.Composite.remove(engine.world, b);
+    }
+    for (const e of burningRef.current) e.voice.stop();
+    burningRef.current.length = 0;
+    flamesRef.current.length = 0;
+    blackHoleRef.current = null;
     selectedBodyRef.current = null;
     soundRef.current?.clear();
     updateCount();
@@ -578,34 +1302,64 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
     const render = renderRef.current;
     const runner = runnerRef.current;
     if (!engine || !render) return;
+    const registry = registryRef.current;
+    if (!registry) return;
     clearGenerationRef.current += 1;
-    clearBodies(engine, render);
+    registry.removeAll(engine.world, render);
+    for (const b of nonStaticBodies(engine)) {
+      releaseBodyTexture(render, b);
+      Matter.Composite.remove(engine.world, b);
+    }
+    for (const e of burningRef.current) e.voice.stop();
+    burningRef.current.length = 0;
+    flamesRef.current.length = 0;
     selectedBodyRef.current = null;
     blackHoleRef.current = null;
     soundRef.current?.blackHoleStop();
-    disarmBlackHole();
     soundRef.current?.reset();
     setGravityOn(true);
     setGravityDir('down');
     setGravityStrength(1);
+    engine.timing.timeScale = 1;
+    setSlowMo(false);
     if (runner) {
       runner.enabled = true;
       setPaused(false);
     }
-    addShowcase(engine, render, render.options.width || 800, render.options.height || 600, materialRef.current);
+    addShowcase(
+      engine,
+      render,
+      render.options.width || 800,
+      render.options.height || 600,
+      materialRef.current,
+      registry,
+      spawnAsRef.current,
+      spawnFx,
+    );
     updateCount();
-  }, [updateCount, disarmBlackHole]);
+  }, [updateCount, spawnFx]);
 
   const handleSpawnTest = useCallback(() => {
     const engine = engineRef.current;
     const render = renderRef.current;
     if (!engine || !render) return;
-    addShowcase(engine, render, render.options.width || 800, render.options.height || 600, materialRef.current);
+    const registry = registryRef.current;
+    if (!registry) return;
+    addShowcase(
+      engine,
+      render,
+      render.options.width || 800,
+      render.options.height || 600,
+      materialRef.current,
+      registry,
+      spawnAsRef.current,
+      spawnFx,
+    );
     soundRef.current?.spawnBatch();
-    enforceBodyCap(engine, render);
+    enforceObjectCap(registry, engine.world, render);
     syncSelection();
     updateCount();
-  }, [updateCount, syncSelection]);
+  }, [updateCount, syncSelection, spawnFx]);
 
   const handleExplode = useCallback(() => {
     const engine = engineRef.current;
@@ -617,6 +1371,23 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
     setFxReduced(reduced);
     setBoomRot(Math.random() * 24 - 12);
     const origin = explosionOrigin(nonStaticBodies(engine), w, h, engine.gravity);
+    if (explodeShatterRef.current && registryRef.current) {
+      const registry = registryRef.current;
+      const objs = registry.list();
+      const perObj = Math.max(3, Math.min(14, Math.floor(120 / Math.max(1, objs.length))));
+      for (const obj of objs) {
+        crumbleObject(
+          obj,
+          {
+            x: obj.root.position.x + (Math.random() - 0.5) * 30,
+            y: obj.root.position.y + (Math.random() - 0.5) * 30,
+          },
+          perObj,
+          { sound: false, count: false },
+        );
+      }
+      updateCount();
+    }
     explode(nonStaticBodies(engine), origin, w, h, engine.gravity);
     soundRef.current?.explosion();
     setFxPos({ x: origin.x, y: origin.y });
@@ -654,7 +1425,7 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
       void btn.offsetWidth;
       btn.classList.add('physics-btn--punch');
     }
-  }, []);
+  }, [crumbleObject, updateCount]);
 
   const handleMaterialChange = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
     const name = e.target.value as MaterialName;
@@ -662,23 +1433,16 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
     setMaterial(name);
     materialRef.current = name;
     const sel = selectedBodyRef.current;
-    if (sel) applyMaterial(sel, name);
+    if (sel) {
+      const obj = registryRef.current?.objectOf(sel);
+      for (const b of obj ? obj.bodies : [sel]) {
+        if (!b.isStatic) applyMaterial(b, name);
+      }
+    }
     soundRef.current?.impact(0.7, name);
   }, []);
 
-  const toggleBlackHoleArm = useCallback(() => {
-    if (blackHoleArmedRef.current) {
-      disarmBlackHole();
-      return;
-    }
-    soundRef.current?.click();
-    const mc = mouseConstraintRef.current;
-    if (!mc) return;
-    savedMaskRef.current = mc.collisionFilter.mask;
-    mc.collisionFilter.mask = 0;
-    blackHoleArmedRef.current = true;
-    setBlackHoleArmed(true);
-  }, [disarmBlackHole]);
+
 
   const handleSnapshot = useCallback(() => {
     const render = renderRef.current;
@@ -742,6 +1506,21 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
   return (
     <div className="physics" onPointerDownCapture={() => soundRef.current?.unlock()}>
       <div ref={stageRef} className="physics-stage">
+        <div className="physics-tools" role="toolbar" aria-label="Tools">
+          {TOOLS.map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              className={`physics-tools__btn${tool === t.id ? ' is-active' : ''}`}
+              aria-label={t.label}
+              title={t.label}
+              aria-pressed={tool === t.id}
+              onClick={() => setTool(t.id)}
+            >
+              {t.icon}
+            </button>
+          ))}
+        </div>
         {scorchKey > 0 && (
           <div
             key={`scorch-${scorchKey}`}
@@ -758,7 +1537,9 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
             </span>
             <span className="physics-status__chip">{gravityLabel}</span>
             <span className="physics-status__chip">Material: {MATERIALS[material].label}</span>
+            {spawnAs === 'jelly' && <span className="physics-status__chip">Spawn: Jelly</span>}
             {paused && <span className="physics-status__chip physics-status__chip--paused">Paused</span>}
+            {slowMo && <span className="physics-status__chip physics-status__chip--slowmo">Slow-mo</span>}
           </div>
 
           <div className="physics-gravity">
@@ -827,6 +1608,7 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
           </div>
         </div>
 
+        {slowMo && <div className="physics-slowmo" />}
         {objectCount === 0 && (
           <div className="physics-hint">Drag &amp; throw objects • Bring a cutout to life from the studio</div>
         )}
@@ -879,6 +1661,17 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
           {paused ? <Play size={15} /> : <Pause size={15} />}
           <span>{paused ? 'Resume' : 'Pause'}</span>
         </button>
+        <button
+          type="button"
+          className={`physics-btn${slowMo ? ' is-armed' : ''}`}
+          aria-label="Slow-mo"
+          title="Slow-mo — bullet time at 25% speed"
+          aria-pressed={slowMo}
+          onClick={toggleSlowMo}
+        >
+          <Timer size={15} />
+          <span>Slow-mo</span>
+        </button>
         <button type="button" className="physics-btn" aria-label="Clear" title="Clear" onClick={handleClear}>
           <Trash2 size={15} />
           <span>Clear</span>
@@ -907,6 +1700,24 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
           <Camera size={15} />
           <span>Snapshot</span>
         </button>
+        <div className="physics-spawnas" role="group" aria-label="Spawn as">
+          <span className="physics-spawnas__label">Spawn</span>
+          {(['solid', 'jelly'] as const).map((k) => (
+            <button
+              key={k}
+              type="button"
+              className={`physics-spawnas__btn${spawnAs === k ? ' is-active' : ''}`}
+              aria-pressed={spawnAs === k}
+              onClick={() => {
+                spawnAsRef.current = k;
+                setSpawnAs(k);
+                soundRef.current?.click();
+              }}
+            >
+              {k === 'solid' ? 'Solid' : 'Jelly'}
+            </button>
+          ))}
+        </div>
         <label className="physics-material" title="Material for new objects">
           <span className="physics-material__dot" style={{ background: MATERIALS[material].color }} />
           <span className="physics-material__label">Material</span>
@@ -920,14 +1731,33 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
         </label>
         <button
           type="button"
-          className={`physics-btn${blackHoleArmed ? ' is-armed' : ''}`}
-          aria-label="Black Hole"
-          title="Black Hole — click the canvas to place"
-          aria-pressed={blackHoleArmed}
-          onClick={toggleBlackHoleArm}
+          className={`physics-btn${fragile ? ' is-armed' : ''}`}
+          aria-label="Fragile"
+          title="Fragile — hard impacts shatter objects"
+          aria-pressed={fragile}
+          onClick={() => {
+            fragileRef.current = !fragile;
+            setFragile(!fragile);
+            soundRef.current?.click();
+          }}
         >
-          <Orbit size={15} />
-          <span>Black Hole</span>
+          <Hammer size={15} />
+          <span>Fragile</span>
+        </button>
+        <button
+          type="button"
+          className={`physics-btn${explodeShatter ? ' is-armed' : ''}`}
+          aria-label="Explode Shatter"
+          title="Explode → Shatter — explosions crumble objects first"
+          aria-pressed={explodeShatter}
+          onClick={() => {
+            explodeShatterRef.current = !explodeShatter;
+            setExplodeShatter(!explodeShatter);
+            soundRef.current?.click();
+          }}
+        >
+          <Bomb size={15} />
+          <span>Shatter</span>
         </button>
         <button
           type="button"
