@@ -90,7 +90,7 @@ import {
 } from '../lib/physics/fx';
 import { createHullBody } from '../lib/physics/hull';
 import { createJelly, tintJellyTextures } from '../lib/physics/softbody';
-import { createRagdoll, createStickFigure, enforceJointLimits, enforcePinPositions, type RagdollJoint } from '../lib/physics/ragdoll';
+import { createRagdoll, createStickFigure, enforceJointLimits, type RagdollJoint } from '../lib/physics/ragdoll';
 import { createRope, createSpringLink, drawRope, drawSpring } from '../lib/physics/ropes';
 import './PhysicsWorld.css';
 
@@ -601,7 +601,6 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
       for (const obj of registry.list()) {
         if (obj.kind === 'ragdoll' && obj.joints) {
           enforceJointLimits(obj.joints as RagdollJoint[]);
-          enforcePinPositions(obj.constraints);
         }
       }
       const hole = blackHoleRef.current;

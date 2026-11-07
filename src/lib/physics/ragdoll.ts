@@ -279,41 +279,40 @@ export function createRagdoll(opts: {
   pin(partOf('ulegL'), partOf('llegL'), pt.L_KNEE, 2.2);
   pin(partOf('ulegR'), partOf('llegR'), pt.R_KNEE, 2.2);
 
-  for (const b of bodies) applyMaterial(b, material);
+  for (const b of bodies) {
+    applyMaterial(b, material);
+    // a little air drag on the light limb parts damps residual jitter
+    b.frictionAir = Math.max(b.frictionAir, 0.02);
+  }
   // translate everything into world position
   for (const b of bodies) Matter.Body.translate(b, { x, y });
 
   return { bodies, constraints, textureKeys, root: head, joints };
 }
 
-/** Positional pin correction: nudge the two bodies toward each other so the
- *  pin endpoints stay coincident under load (solver alone sags on chains). */
-export function enforcePinPositions(constraints: Matter.Constraint[]): void {
-  for (const c of constraints) {
-    if (!c.bodyA || !c.bodyB || !c.pointA || !c.pointB) continue;
-    const ex = c.bodyB.position.x + c.pointB.x - (c.bodyA.position.x + c.pointA.x);
-    const ey = c.bodyB.position.y + c.pointB.y - (c.bodyA.position.y + c.pointA.y);
-    const e = Math.hypot(ex, ey);
-    if (e < 0.01) continue;
-    const tot = c.bodyA.mass + c.bodyB.mass || 1;
-    const k = 0.7;
-    Matter.Body.translate(c.bodyA, { x: ex * k * (c.bodyB.mass / tot), y: ey * k * (c.bodyB.mass / tot) });
-    Matter.Body.translate(c.bodyB, { x: -ex * k * (c.bodyA.mass / tot), y: -ey * k * (c.bodyA.mass / tot) });
-  }
-}
+/** Wrap an angle to (−π, π] — Matter body angles accumulate without bound. */
+const wrapAngle = (a: number) => a - Math.PI * 2 * Math.round(a / (Math.PI * 2));
 
-/** Soft relative-angle clamp — gentle corrective angular velocities. */
+/**
+ * Soft relative-angle clamp. Only acts past a limit: first removes the part of
+ * the relative spin that pushes further out (damping, no bounce-back), then
+ * adds a small capped correction toward the limit. The angle is wrapped so a
+ * limb that has turned a full revolution isn't "corrected" forever.
+ */
 export function enforceJointLimits(joints: RagdollJoint[]): void {
   for (const j of joints) {
-    const rel = j.b.angle - j.a.angle - j.rest;
+    const rel = wrapAngle(j.b.angle - j.a.angle - j.rest);
     const over = rel > j.max ? rel - j.max : rel < j.min ? rel - j.min : 0;
     if (over === 0) continue;
-    const k = 0.08;
     const tot = j.a.inertia + j.b.inertia || 1;
     const wa = j.b.inertia / tot;
     const wb = j.a.inertia / tot;
-    Matter.Body.setAngularVelocity(j.a, j.a.angularVelocity + over * k * wa);
-    Matter.Body.setAngularVelocity(j.b, j.b.angularVelocity - over * k * wb);
+    const relW = j.b.angularVelocity - j.a.angularVelocity;
+    const outward = (over > 0 && relW > 0) || (over < 0 && relW < 0) ? relW : 0;
+    const fix = Math.max(-0.04, Math.min(0.04, over * 0.05));
+    const dw = outward + fix;
+    Matter.Body.setAngularVelocity(j.a, j.a.angularVelocity + dw * wa);
+    Matter.Body.setAngularVelocity(j.b, j.b.angularVelocity - dw * wb);
   }
 }
 
