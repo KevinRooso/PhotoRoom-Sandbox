@@ -25,6 +25,8 @@ export interface ObjectRegistry {
   removeAll(world: Matter.World, render: Matter.Render): void;
   objectOf(body: Matter.Body): PhysObject | undefined;
   list(): PhysObject[];
+  /** every body of every registered object (includes frozen/static roots) */
+  allBodies(): Matter.Body[];
   readonly size: number;
   nextId(): number;
 }
@@ -73,6 +75,12 @@ export function createObjectRegistry(): ObjectRegistry {
 
     list() {
       return [...objects.values()]; // Map order = oldest first
+    },
+
+    allBodies() {
+      const out: Matter.Body[] = [];
+      for (const obj of objects.values()) out.push(...obj.bodies);
+      return out;
     },
 
     get size() {

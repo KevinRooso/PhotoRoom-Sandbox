@@ -163,3 +163,46 @@ export function createMaterializeFx(x: number, y: number): ParticleBurst {
 }
 
 export type { ParticleBurst as Burst };
+
+// ============================================================================
+// Glow rings — expanding stroke rings (spawn materialize)
+// ============================================================================
+
+export interface RingFx {
+  x: number; y: number; r0: number; r1: number;
+  age: number; life: number; color: string; width: number;
+}
+
+export function createGlowRing(
+  x: number,
+  y: number,
+  color = 'rgba(34,211,238,0.9)',
+  r1 = 90,
+): RingFx {
+  return { x, y, r0: 4, r1, age: 0, life: 420, color, width: 3 };
+}
+
+/** Advance and draw live rings; removes finished entries in place. */
+export function stepAndDrawRings(
+  ctx: CanvasRenderingContext2D,
+  rings: RingFx[],
+  dtMs: number,
+): void {
+  for (let i = rings.length - 1; i >= 0; i--) {
+    const r = rings[i];
+    r.age += dtMs;
+    if (r.age > r.life) {
+      rings.splice(i, 1);
+      continue;
+    }
+    const t = r.age / r.life;
+    const e = 1 - Math.pow(1 - t, 3); // easeOutCubic
+    ctx.globalAlpha = (1 - t) * 0.9;
+    ctx.strokeStyle = r.color;
+    ctx.lineWidth = r.width * (1 - t) + 0.5;
+    ctx.beginPath();
+    ctx.arc(r.x, r.y, r.r0 + (r.r1 - r.r0) * e, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
