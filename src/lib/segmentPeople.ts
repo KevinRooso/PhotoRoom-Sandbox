@@ -341,6 +341,72 @@ function labelComponents(
   return { compId, sizes };
 }
 
+function reassignIslands(
+  grid: Int32Array,
+  gw: number,
+  gh: number,
+  peopleCount: number,
+): void {
+  for (let p = 0; p < peopleCount; p += 1) {
+    const { compId, sizes } = labelComponents(grid, gw, gh, (v) => v === p);
+    if (sizes.size <= 1) continue;
+
+    let largest = 0;
+    for (const size of sizes.values()) largest = Math.max(largest, size);
+
+    const small = new Set<number>();
+    for (const [comp, size] of sizes) {
+      if (size < largest && size < largest * 0.25) small.add(comp);
+    }
+    if (small.size === 0) continue;
+
+    const tallies = new Map<number, Map<number, number>>();
+    for (let cell = 0; cell < gw * gh; cell += 1) {
+      const comp = compId[cell];
+      if (!small.has(comp)) continue;
+      const cx = cell % gw;
+      const cy = (cell - cx) / gw;
+      for (const [dx, dy] of [
+        [1, 0],
+        [-1, 0],
+        [0, 1],
+        [0, -1],
+      ] as const) {
+        const nx = cx + dx;
+        const ny = cy + dy;
+        if (nx < 0 || ny < 0 || nx >= gw || ny >= gh) continue;
+        const label = grid[ny * gw + nx];
+        if (label === p || label === DISCARDED) continue;
+        let tally = tallies.get(comp);
+        if (!tally) {
+          tally = new Map();
+          tallies.set(comp, tally);
+        }
+        tally.set(label, (tally.get(label) ?? 0) + 1);
+      }
+    }
+
+    const reassignment = new Map<number, number>();
+    for (const [comp, tally] of tallies) {
+      let bestLabel = -1;
+      let bestCount = 0;
+      for (const [label, count] of tally) {
+        if (count > bestCount) {
+          bestCount = count;
+          bestLabel = label;
+        }
+      }
+      if (bestCount > 0) reassignment.set(comp, bestLabel);
+    }
+    if (reassignment.size === 0) continue;
+
+    for (let cell = 0; cell < gw * gh; cell += 1) {
+      const newLabel = reassignment.get(compId[cell]);
+      if (newLabel !== undefined) grid[cell] = newLabel;
+    }
+  }
+}
+
 function buildRegions(
   grid: Int32Array,
   gw: number,
@@ -697,6 +763,8 @@ export async function segmentPeople(
         }
       }
     }
+
+    if (people.length > 0) reassignIslands(grid, gw, gh, people.length);
 
     const built = buildRegions(grid, gw, gh, foregroundCells, people);
 
