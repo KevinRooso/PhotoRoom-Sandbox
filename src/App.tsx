@@ -1,4 +1,5 @@
 import { useCallback, useState } from 'react';
+import { Atom } from 'lucide-react';
 import StudioPanel from './components/StudioPanel';
 import PhysicsWorld from './components/PhysicsWorld';
 import type { CutoutAsset } from './types/asset';
@@ -13,12 +14,21 @@ export default function App() {
 
   return (
     <div className="app">
-      <section className="app__studio">
-        <StudioPanel onSpawn={handleSpawn} />
-      </section>
-      <section className="app__physics">
-        <PhysicsWorld spawnRequests={spawnRequests} />
-      </section>
+      <header className="app-topbar">
+        <span className="app-brand-mark" aria-hidden="true">
+          <Atom size={20} />
+        </span>
+        <span className="app-wordmark">PhysicsLab</span>
+        <span className="app-tagline">Photo → Physics</span>
+      </header>
+      <main className="app-body">
+        <aside className="app-studio">
+          <StudioPanel onSpawn={handleSpawn} />
+        </aside>
+        <section className="app-stage">
+          <PhysicsWorld spawnRequests={spawnRequests} />
+        </section>
+      </main>
     </div>
   );
 }

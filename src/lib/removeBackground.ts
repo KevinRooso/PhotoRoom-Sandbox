@@ -5,6 +5,8 @@ export type RemovalPhase =
   | 'idle'
   | 'downloading-model'
   | 'processing'
+  | 'detecting'
+  | 'separating'
   | 'done'
   | 'error';
 
@@ -89,6 +91,72 @@ export function preloadModel(): Promise<void> {
     throw error;
   });
   return modelPreloadPromise;
+}
+
+export async function prepareImage(
+  file: Blob,
+): Promise<{ blob: Blob; width: number; height: number }> {
+  const image = await decodeImage(file);
+
+  try {
+    const longestSide = Math.max(image.width, image.height);
+    if (longestSide <= MAX_IMAGE_SIDE) {
+      return { blob: file, width: image.width, height: image.height };
+    }
+
+    const scale = MAX_IMAGE_SIDE / longestSide;
+    const width = Math.max(1, Math.round(image.width * scale));
+    const height = Math.max(1, Math.round(image.height * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+
+    const context = canvas.getContext('2d');
+    if (!context) throw new Error('Could not prepare the image for processing.');
+
+    context.drawImage(image.source, 0, 0, width, height);
+    return { blob: await canvasToPng(canvas), width, height };
+  } finally {
+    image.close?.();
+  }
+}
+
+export async function removeBackgroundFullFrame(
+  input: Blob,
+  onProgress?: (progress: RemovalProgress) => void,
+): Promise<ImageData> {
+  const listener = onProgress;
+  activeProgressListener = listener;
+
+  try {
+    const source = await prepareImage(input);
+    const result = await removeBackground(source.blob, sharedConfig);
+    const image = await decodeImage(result);
+
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = source.width;
+      canvas.height = source.height;
+
+      const context = canvas.getContext('2d', { willReadFrequently: true });
+      if (!context) throw new Error('Could not inspect the processed image.');
+
+      context.drawImage(image.source, 0, 0, source.width, source.height);
+      return context.getImageData(0, 0, source.width, source.height);
+    } finally {
+      image.close?.();
+    }
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : 'Could not remove the image background.';
+    throw new Error(message || 'Could not remove the image background.');
+  } finally {
+    if (activeProgressListener === listener) activeProgressListener = undefined;
+  }
+}
+
+export function encodePng(canvas: HTMLCanvasElement): Promise<Blob> {
+  return canvasToPng(canvas);
 }
 
 export async function removeImageBackground(
