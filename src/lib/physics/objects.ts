@@ -15,6 +15,8 @@ export interface PhysObject {
   /** texture keys released on removal */
   textureKeys: string[];
   createdAt: number;
+  /** ragdoll joint limits enforced in beforeUpdate */
+  joints?: unknown[];
 }
 
 export const MAX_OBJECTS = 60;
