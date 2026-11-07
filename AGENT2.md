@@ -17,6 +17,7 @@ Your branch is `feat/physics-world`.
 - HTML Canvas via Matter.js renderer
 - CSS for controls and visual effects
 - `lucide-react` for icons
+- The base scaffold on `master` already contains every dependency (`matter-js`, `@types/matter-js`, `lucide-react`, plus the photo editor's packages). Run `npm install` then `npm run dev`. Do not add, remove, or upgrade packages.
 
 Do not build a physics engine from scratch.
 
@@ -24,15 +25,31 @@ Do not build a physics engine from scratch.
 
 You own ONLY:
 
-- `src/components/PhysicsWorld.tsx`
+- `src/components/PhysicsWorld.tsx` (currently a placeholder on `master` — replace it)
 - `src/components/PhysicsWorld.css`
 - `src/lib/physics.ts`
 
-Do not edit `App.tsx`, the photo studio, shared types, package files, or the other agent's components. Do not push directly to main.
+Do not edit `src/App.tsx`, `src/App.css`, `src/index.css`, `src/main.tsx`, `vite.config.ts`, `index.html`, `package.json`, `package-lock.json`, `src/types/asset.ts`, `public/demo/`, or any photo studio file. Do not push directly to `master`. If a shared file seems to need a change, stop and report it instead.
 
 ## Integration contract
 
-Import `CutoutAsset` from `src/types/asset.ts`.
+Import `CutoutAsset` (and the spawn size constants) from `src/types/asset.ts`:
+
+```ts
+export interface CutoutAsset {
+  id: string;          // unique per spawn event
+  assetId: string;     // stable library item id, same across re-spawns
+  name: string;
+  url: string;         // blob: URL or /demo/<file>, with real transparency
+  width: number;       // natural pixel width of the image at url
+  height: number;      // natural pixel height of the image at url
+  source: 'upload' | 'demo';
+  spawnSize?: number;  // optional max rendered dimension (px)
+}
+// also exported: DEFAULT_SPAWN_SIZE = 160, MIN_SPAWN_SIZE = 40, MAX_SPAWN_SIZE = 320
+```
+
+`src/App.tsx` (already on `master`) keeps a `spawnRequests: CutoutAsset[]` state, appends to it in `onSpawn`, and passes it to `PhysicsWorld`. Entries are never removed or mutated.
 
 Export a default component:
 
@@ -44,7 +61,8 @@ The parent passes an array of spawn requests.
 - For each unseen ID, load the image texture and create one Matter.js body.
 - Objects should appear near the upper-middle of the canvas and fall due to gravity.
 - Preserve aspect ratio.
-- Limit oversized objects to reasonable canvas dimensions, for example 160 px maximum width or height.
+- Size: the body's longest side is `spawnSize ?? DEFAULT_SPAWN_SIZE`, clamped to `MIN_SPAWN_SIZE`–`MAX_SPAWN_SIZE` and to the canvas size. Use `width`/`height` for the aspect ratio; if either is 0 or missing, fall back to the loaded image's `naturalWidth`/`naturalHeight`.
+- `url` may be a `blob:` URL or a same-origin path like `/demo/rocket.svg`. Do not revoke or modify it.
 - Track processed IDs to avoid spawning duplicates on React re-renders.
 - On image-loading failure, render a visible coloured placeholder body rather than crashing.
 - Clearing the world must not cause old requests to respawn.
@@ -115,6 +133,9 @@ Provide a material selector that affects newly created objects or the currently 
 
 The visual style should feel like a modern science experiment crossed with an arcade sandbox.
 
+- Use the shared CSS variables from `src/index.css` (`--bg`, `--panel`, `--panel-2`, `--border`, `--text`, `--muted`, `--accent-purple`, `--accent-cyan`, `--danger`, `--radius`) so both halves match.
+- Prefix all your CSS classes with `physics-` to avoid collisions with the photo studio.
+
 Suggested layout:
 - Large central physics canvas
 - Floating status bar with number of objects
@@ -130,7 +151,7 @@ The app must feel interactive even before an image is uploaded.
 - Use refs for the engine, runner, renderer, and processed request IDs.
 - Clean up renderer, runner, events, and mouse listeners on unmount.
 - Avoid re-creating the engine when new props arrive.
-- Handle canvas resizing and update boundaries.
+- Handle canvas resizing and update boundaries. The component is rendered inside `.app__physics` (right column on wide screens, stacked below 1100 px), which has a definite size; the component root must be `width: 100%; height: 100%` and size the canvas from its container with a `ResizeObserver`, not from the window.
 - Ensure image sprites scale correctly to their physics bodies.
 - Keep the animation smooth with approximately 20 objects.
 - Prefer simple stable physics over complex effects.
@@ -150,7 +171,7 @@ The app must feel interactive even before an image is uploaded.
 
 ## Delivery
 
-Commit to `feat/physics-world`, push the branch, and create a pull request to main.
+Commit to `feat/physics-world`, push the branch, and create a pull request to `master`.
 
 Report:
 - Implemented features
@@ -159,3 +180,10 @@ Report:
 - Known limitations
 
 Do not modify the shared application files or the other agent's implementation.
+
+## Integration and merge
+
+- The base scaffold (dependencies, `CutoutAsset`, `App.tsx` wiring, layout, theme variables, placeholder components) is already on `master`. Branch from the latest `master`.
+- Your branch should only touch the files you own, so merging both PRs into `master` is conflict-free.
+- `npm run build` and `npm run lint` must pass on your branch before you open the PR.
+- After both PRs are merged, one developer runs the end-to-end check on `master`: upload → remove background → Bring to Life → object falls, can be dragged/thrown; spawn the same cutout twice; demo objects spawn; gravity/explode/reset still work.
