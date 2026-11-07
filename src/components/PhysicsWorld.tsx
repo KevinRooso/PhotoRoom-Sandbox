@@ -5,11 +5,13 @@ import {
   ArrowLeft,
   ArrowRight,
   ArrowUp,
+  Anchor,
   Bomb,
   Camera,
   Flame,
   Hammer,
   Hand,
+  Link,
   Orbit,
   Pause,
   Play,
@@ -69,6 +71,7 @@ import {
   type PhysObject,
 } from '../lib/physics/objects';
 import {
+  localTexture,
   MAX_SHARDS,
   shatterBody,
   shardExpired,
@@ -86,6 +89,8 @@ import {
   type RingFx,
 } from '../lib/physics/fx';
 import { createHullBody } from '../lib/physics/hull';
+import { createJelly, tintJellyTextures } from '../lib/physics/softbody';
+import { createRope, createSpringLink, drawRope, drawSpring } from '../lib/physics/ropes';
 import './PhysicsWorld.css';
 
 export interface PhysicsWorldProps {
@@ -109,15 +114,20 @@ const MOUSE_EVENTS: Array<[string, 'mousemove' | 'mousedown' | 'mouseup' | 'mous
   ['touchend', 'mouseup'],
 ];
 
-type ToolName = 'grab' | 'crumble' | 'freeze' | 'fire' | 'blackhole';
+type ToolName = 'grab' | 'crumble' | 'freeze' | 'fire' | 'hang' | 'link' | 'blackhole';
+type SpawnKind = 'solid' | 'jelly';
 
 const TOOLS: Array<{ id: ToolName; label: string; icon: React.ReactNode }> = [
   { id: 'grab', label: 'Grab', icon: <Hand size={16} /> },
   { id: 'crumble', label: 'Crumble', icon: <Hammer size={16} /> },
   { id: 'freeze', label: 'Freeze', icon: <Snowflake size={16} /> },
   { id: 'fire', label: 'Fire', icon: <Flame size={16} /> },
+  { id: 'hang', label: 'Hang', icon: <Anchor size={16} /> },
+  { id: 'link', label: 'Link', icon: <Link size={16} /> },
   { id: 'blackhole', label: 'Black Hole', icon: <Orbit size={16} /> },
 ];
+
+const MAX_ROPES = 12;
 
 /** Engine-time burn duration (ms). */
 const BURN_MS = 3000;
@@ -142,12 +152,57 @@ function addShowcase(
   h: number,
   material: MaterialName,
   registry: ObjectRegistry,
-  spawnFx?: (body: Matter.Body) => void,
+  spawnAs: SpawnKind,
+  spawnFx?: (body: Matter.Body, opts?: { sound?: boolean }) => void,
 ): void {
   for (const item of createTestObjects(w, h)) {
+    if (spawnAs === 'jelly') {
+      const body = item.body;
+      const local = body.vertices.map((v) => ({
+        x: v.x - body.position.x,
+        y: v.y - body.position.y,
+      }));
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      for (const v of local) {
+        if (v.x < minX) minX = v.x;
+        if (v.y < minY) minY = v.y;
+        if (v.x > maxX) maxX = v.x;
+        if (v.y > maxY) maxY = v.y;
+      }
+      const bw = maxX - minX;
+      const bh = maxY - minY;
+      const tex = item.texture
+        ? item.texture.canvas
+        : localTexture(body, render, local, bw, bh);
+      const jelly = createJelly({
+        x: body.position.x,
+        y: body.position.y,
+        w: bw,
+        h: bh,
+        texture: tex,
+        render,
+        material,
+      });
+      if (jelly) {
+        registry.add(engine.world, {
+          id: registry.nextId(),
+          kind: 'jelly',
+          root: jelly.root,
+          bodies: jelly.bodies,
+          constraints: jelly.constraints,
+          textureKeys: jelly.textureKeys,
+          createdAt: engine.timing.timestamp,
+        });
+        spawnFx?.(jelly.root, { sound: false });
+        continue;
+      }
+    }
     if (item.texture) registerTexture(render, item.texture.key, item.texture.canvas);
     applyMaterial(item.body, material);
-    spawnFx?.(item.body);
+    spawnFx?.(item.body, { sound: false });
     registry.add(engine.world, {
       id: registry.nextId(),
       kind: 'solid',
@@ -185,6 +240,13 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
   const dustTimesRef = useRef<number[]>([]);
   const fragileRef = useRef(false);
   const explodeShatterRef = useRef(false);
+  const spawnAsRef = useRef<SpawnKind>('solid');
+  const pendingLinkRef = useRef<{
+    obj: PhysObject;
+    body: Matter.Body;
+    point: { x: number; y: number };
+    angle: number;
+  } | null>(null);
   const soundRef = useRef<SoundEngine | null>(null);
   const fxListRef = useRef<ExplosionFx[]>([]);
   const trailUntilRef = useRef(0);
@@ -201,6 +263,7 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
   const [fragile, setFragile] = useState(false);
   const [explodeShatter, setExplodeShatter] = useState(false);
   const [slowMo, setSlowMo] = useState(false);
+  const [spawnAs, setSpawnAs] = useState<SpawnKind>('solid');
   const [muted, setMuted] = useState(readStoredMuted);
   const [fxKey, setFxKey] = useState(0);
   const [fxReduced, setFxReduced] = useState(false);
@@ -227,6 +290,7 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
   const setTool = useCallback((t: ToolName) => {
     toolRef.current = t;
     setToolState(t);
+    pendingLinkRef.current = null;
     const mc = mouseConstraintRef.current;
     if (mc) {
       mc.collisionFilter.mask = t === 'grab' ? defaultMaskRef.current : 0;
@@ -277,8 +341,63 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
     [updateCount],
   );
 
+  /** Dissolve a composite object (jelly): drop springs/registry entry but keep
+   *  the bodies in the world as shards. */
+  const dissolveObject = useCallback(
+    (
+      obj: PhysObject,
+      impact: { x: number; y: number },
+      opts?: { sound?: boolean; dust?: boolean; count?: boolean; tint?: 'ice' | 'ash' | null },
+    ) => {
+      const engine = engineRef.current;
+      const render = renderRef.current;
+      const registry = registryRef.current;
+      if (!engine || !render || !registry || obj.kind === 'solid') return;
+      const frozen = (obj.root.plugin as Record<string, unknown> | undefined)?.frozen === true;
+      const tint = opts?.tint !== undefined ? opts.tint : frozen ? 'ice' : null;
+      if (tint) tintJellyTextures(obj, render, tint);
+      registry.drop(engine.world, obj);
+      const now = engine.timing.timestamp;
+      for (const b of obj.bodies) {
+        b.collisionFilter.group = 0;
+        Matter.Body.setStatic(b, false);
+        tagShard(b, now);
+        (b.plugin as Record<string, unknown>).shard = true;
+      }
+      // shard cap: remove oldest beyond MAX_SHARDS
+      const shardBodies = nonStaticBodies(engine).filter(
+        (b) => (b.plugin as Record<string, unknown> | undefined)?.shard,
+      );
+      for (let i = 0; i < shardBodies.length - MAX_SHARDS; i++) {
+        releaseBodyTexture(render, shardBodies[i]);
+        Matter.Composite.remove(engine.world, shardBodies[i]);
+      }
+      if (opts?.dust !== false) dustBurstsRef.current.push(createDustBurst(impact.x, impact.y, tint));
+      if (opts?.sound !== false) soundRef.current?.crack(0.8);
+      if (selectedBodyRef.current && obj.bodies.includes(selectedBodyRef.current)) {
+        selectedBodyRef.current = null;
+      }
+      if (opts?.count !== false) updateCount();
+    },
+    [updateCount],
+  );
+
+  /** Crumble entry point: solids shatter, composites dissolve. */
+  const crumbleObject = useCallback(
+    (
+      obj: PhysObject,
+      impact: { x: number; y: number },
+      shardCount?: number,
+      opts?: { sound?: boolean; dust?: boolean; count?: boolean; tint?: 'ice' | 'ash' | null },
+    ) => {
+      if (obj.kind === 'solid') shatterObject(obj, impact, shardCount, opts);
+      else dissolveObject(obj, impact, opts);
+    },
+    [shatterObject, dissolveObject],
+  );
+
   /** Materialize feedback for a newly spawned body (ring + sparkles + scale-in). */
-  const spawnFx = useCallback((body: Matter.Body) => {
+  const spawnFx = useCallback((body: Matter.Body, opts?: { sound?: boolean }) => {
     ringsRef.current.push(createGlowRing(body.position.x, body.position.y));
     dustBurstsRef.current.push(createMaterializeFx(body.position.x, body.position.y));
     const sp = body.render.sprite;
@@ -289,13 +408,13 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
       ys: sp?.yScale ?? 1,
     });
     body.render.opacity = 0;
-    soundRef.current?.materialize();
+    if (opts?.sound !== false) soundRef.current?.materialize();
   }, []);
 
   // effect-stable access without making the mount effect depend on callbacks
-  const actionsRef = useRef({ shatterObject, setTool });
+  const actionsRef = useRef({ crumbleObject, setTool });
   useEffect(() => {
-    actionsRef.current = { shatterObject, setTool };
+    actionsRef.current = { crumbleObject, setTool };
   });
 
   // --- Engine lifecycle (runs once per mount; StrictMode-safe) ---------------
@@ -390,7 +509,7 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
             e.voice.stop();
             burning.splice(i, 1);
             const c = e.obj.root.position;
-            actionsRef.current.shatterObject(e.obj, { x: c.x, y: c.y }, undefined, {
+            actionsRef.current.crumbleObject(e.obj, { x: c.x, y: c.y }, undefined, {
               tint: 'ash',
             });
             dustBursts.push(createDustBurst(c.x, c.y, 'ash'));
@@ -487,7 +606,7 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
         shatterQueue.clear();
         for (const obj of registry.list()) {
           if (ids.has(obj.id)) {
-            actionsRef.current.shatterObject(obj, {
+            actionsRef.current.crumbleObject(obj, {
               x: obj.root.position.x + (Math.random() - 0.5) * 20,
               y: obj.root.position.y + (Math.random() - 0.5) * 20,
             });
@@ -538,7 +657,7 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
         const hit = Matter.Query.point(registry.allBodies(), pos)[0];
         if (hit) {
           const obj = registry.objectOf(hit);
-          if (obj && obj.kind === 'solid') actionsRef.current.shatterObject(obj, pos);
+          if (obj) actionsRef.current.crumbleObject(obj, pos);
         }
         return;
       }
@@ -576,6 +695,79 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
             }
           }
         }
+        return;
+      }
+      if (tool === 'hang') {
+        const hit = Matter.Query.point(registry.allBodies(), pos)[0];
+        if (hit) {
+          const obj = registry.objectOf(hit);
+          if (obj) {
+            // anchor on the stage edge opposite gravity
+            const g = engine.gravity;
+            const cw = render.options.width || 800;
+            const ch = render.options.height || 600;
+            const anchor =
+              Math.abs(g.y) >= Math.abs(g.x)
+                ? { x: pos.x, y: g.y > 0 ? 8 : ch - 8 }
+                : { x: g.x > 0 ? 8 : cw - 8, y: pos.y };
+            const { bodies: rb, constraints: rc } = createRope(anchor, pos, hit);
+            registry.attach(engine.world, {
+              id: registry.nextId(),
+              kind: 'rope',
+              objectIds: [obj.id],
+              bodies: rb,
+              constraints: rc,
+              anchor,
+            });
+            const ropes = registry.attachments().filter((a) => a.kind === 'rope');
+            for (let i = 0; i < ropes.length - MAX_ROPES; i++) {
+              registry.detach(engine.world, ropes[i]);
+            }
+            sound.click();
+          }
+        }
+        return;
+      }
+      if (tool === 'link') {
+        const hit = Matter.Query.point(registry.allBodies(), pos)[0];
+        const pending = pendingLinkRef.current;
+        if (!hit) {
+          pendingLinkRef.current = null;
+          return;
+        }
+        const obj = registry.objectOf(hit);
+        if (!obj) return;
+        if (!pending) {
+          pendingLinkRef.current = {
+            obj,
+            body: hit,
+            point: { x: pos.x - hit.position.x, y: pos.y - hit.position.y },
+            angle: hit.angle,
+          };
+          sound.click();
+          return;
+        }
+        if (pending.obj === obj) {
+          pendingLinkRef.current = null;
+          return;
+        }
+        const pointB = { x: pos.x - hit.position.x, y: pos.y - hit.position.y };
+        // A may have turned since it was picked: rotate its world-frame offset along
+        const da = pending.body.angle - pending.angle;
+        const pointA = {
+          x: pending.point.x * Math.cos(da) - pending.point.y * Math.sin(da),
+          y: pending.point.x * Math.sin(da) + pending.point.y * Math.cos(da),
+        };
+        const c = createSpringLink(pending.body, hit, pointA, pointB);
+        registry.attach(engine.world, {
+          id: registry.nextId(),
+          kind: 'spring',
+          objectIds: [pending.obj.id, obj.id],
+          bodies: [],
+          constraints: [c],
+        });
+        pendingLinkRef.current = null;
+        sound.click();
         return;
       }
       // grab tool: deselect on empty-canvas click
@@ -659,23 +851,49 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
         for (const b of flames) flameCount += b.particles.length;
         for (const e of burning) {
           if (flameCount > 300) break;
-          const verts = e.obj.root.vertices;
-          const v = verts[(Math.random() * verts.length) | 0];
+          // spawn points biased to the anti-gravity side of every tile
+          const bodies2 = e.obj.bodies;
+          const bb = bodies2[(Math.random() * bodies2.length) | 0];
+          const verts = bb.vertices;
+          const g = engine.gravity;
+          let v = verts[(Math.random() * verts.length) | 0];
+          for (let i = 0; i < 3; i++) {
+            const c2 = verts[(Math.random() * verts.length) | 0];
+            if ((c2.x - bb.position.x) * -g.x + (c2.y - bb.position.y) * -g.y >
+                (v.x - bb.position.x) * -g.x + (v.y - bb.position.y) * -g.y) v = c2;
+          }
           const b2 = createBurst(v.x, v.y, {
-            count: 2,
+            count: 3 + ((Math.random() * 2) | 0),
             colors: ['rgba(255,140,20,0.9)', 'rgba(255,90,10,0.85)', 'rgba(255,200,60,0.9)'],
-            speedMin: 20,
-            speedMax: 80,
-            dirAngle: Math.atan2(-engine.gravity.y, -engine.gravity.x || 0.001),
-            spread: 0.5,
-            r0: [1.5, 3.5],
-            r1: [0, 1],
-            life: [300, 700],
+            speedMin: 40,
+            speedMax: 120,
+            dirAngle: Math.atan2(-g.y, -g.x || 0.001),
+            spread: 0.55,
+            r0: [4, 9],
+            r1: [0, 2],
+            life: [400, 900],
             drag: 2,
             additive: true,
           });
           flameCount += b2.particles.length;
           flames.push(b2);
+          if (Math.random() < 0.12) {
+            const emb = createBurst(v.x, v.y, {
+              count: 1,
+              colors: ['rgba(255,240,180,0.95)'],
+              speedMin: 60,
+              speedMax: 160,
+              dirAngle: Math.atan2(-g.y, -g.x || 0.001),
+              spread: 1.2,
+              r0: [1, 2],
+              r1: [0, 0.5],
+              life: [700, 1200],
+              drag: 1.2,
+              additive: true,
+            });
+            flameCount += emb.particles.length;
+            flames.push(emb);
+          }
         }
       }
       // icy overlay on frozen bodies + burn overlay
@@ -688,30 +906,45 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
           ctx.moveTo(verts[0].x, verts[0].y);
           for (let i = 1; i < verts.length; i++) ctx.lineTo(verts[i].x, verts[i].y);
           ctx.closePath();
-          ctx.fillStyle = 'rgba(150, 210, 255, 0.28)';
+          ctx.fillStyle = 'rgba(160, 215, 255, 0.45)';
           ctx.fill();
-          ctx.strokeStyle = 'rgba(190, 235, 255, 0.85)';
+          ctx.save();
+          ctx.shadowColor = 'rgba(140, 210, 255, 0.9)';
+          ctx.shadowBlur = 12;
+          ctx.strokeStyle = 'rgba(200, 238, 255, 0.95)';
           ctx.lineWidth = 2;
           ctx.stroke();
-          ctx.strokeStyle = 'rgba(230, 245, 255, 0.7)';
-          ctx.lineWidth = 1;
-          for (let i = 0; i < verts.length; i += 2) {
-            const v = verts[i];
+          ctx.restore();
+          // 4-point sparkle glints at a few vertices
+          ctx.strokeStyle = 'rgba(240, 250, 255, 0.9)';
+          ctx.lineWidth = 1.2;
+          const glints = Math.min(4, Math.max(3, verts.length >> 1));
+          for (let i = 0; i < glints; i++) {
+            const v = verts[(i * 2) % verts.length];
             ctx.beginPath();
-            ctx.moveTo(v.x - 4, v.y - 4);
-            ctx.lineTo(v.x + 4, v.y + 4);
+            ctx.moveTo(v.x - 5, v.y);
+            ctx.lineTo(v.x + 5, v.y);
+            ctx.moveTo(v.x, v.y - 5);
+            ctx.lineTo(v.x, v.y + 5);
             ctx.stroke();
           }
         }
         for (const e of burning) {
           const p = Math.min(1, (ts - e.t0) / BURN_MS);
+          for (const bb of e.obj.bodies) {
+            const verts = bb.vertices;
+            ctx.beginPath();
+            ctx.moveTo(verts[0].x, verts[0].y);
+            for (let i = 1; i < verts.length; i++) ctx.lineTo(verts[i].x, verts[i].y);
+            ctx.closePath();
+            ctx.fillStyle = 'rgba(10, 6, 4, ' + (0.55 * p).toFixed(3) + ')';
+            ctx.fill();
+          }
           const verts = e.obj.root.vertices;
           ctx.beginPath();
           ctx.moveTo(verts[0].x, verts[0].y);
           for (let i = 1; i < verts.length; i++) ctx.lineTo(verts[i].x, verts[i].y);
           ctx.closePath();
-          ctx.fillStyle = 'rgba(10, 6, 4, ' + (0.55 * p).toFixed(3) + ')';
-          ctx.fill();
           ctx.save();
           ctx.shadowColor = 'rgba(255, 120, 20, 0.9)';
           ctx.shadowBlur = 10;
@@ -768,6 +1001,30 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
         ctx.globalAlpha = 1;
       }
 
+      // attachments: ropes + link springs
+      for (const att of registry.attachments()) {
+        if (att.kind === 'rope') drawRope(ctx, att);
+        else drawSpring(ctx, att);
+      }
+      // pending link pick: pulsing outline on A
+      {
+        const pend = pendingLinkRef.current;
+        if (pend && registry.objectOf(pend.body)) {
+          const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 160);
+          const verts = pend.body.vertices;
+          ctx.beginPath();
+          ctx.moveTo(verts[0].x, verts[0].y);
+          for (let i = 1; i < verts.length; i++) ctx.lineTo(verts[i].x, verts[i].y);
+          ctx.closePath();
+          ctx.save();
+          ctx.shadowColor = 'rgba(34, 211, 238, 0.9)';
+          ctx.shadowBlur = 10;
+          ctx.strokeStyle = 'rgba(34, 211, 238, ' + (0.4 + 0.5 * pulse).toFixed(3) + ')';
+          ctx.lineWidth = 2.5;
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
       // selected body outline
       const sel = selectedBodyRef.current;
       if (sel && Matter.Composite.allBodies(engine.world).includes(sel)) {
@@ -810,7 +1067,7 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
     Matter.Runner.run(runner, engine);
     Matter.Render.run(render);
 
-    addShowcase(engine, render, w, h, materialRef.current, registry);
+    addShowcase(engine, render, w, h, materialRef.current, registry, spawnAsRef.current);
     setObjectCount(registry.size);
 
     // debug hook for automated verification
@@ -895,9 +1152,36 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
         const ch = render.options.height || 600;
         const size = computeBodySize(request, img.naturalWidth, img.naturalHeight, cw, ch);
         const texture = rasterizeTexture(img, size.width, size.height);
+        const pos = spawnPosition(cw, ch, size.height);
+        if (spawnAsRef.current === 'jelly') {
+          const jelly = createJelly({
+            x: pos.x,
+            y: pos.y,
+            w: size.width,
+            h: size.height,
+            texture,
+            render,
+            material: materialRef.current,
+          });
+          if (jelly) {
+            registry.add(engine.world, {
+              id: registry.nextId(),
+              kind: 'jelly',
+              root: jelly.root,
+              bodies: jelly.bodies,
+              constraints: jelly.constraints,
+              textureKeys: jelly.textureKeys,
+              createdAt: engine.timing.timestamp,
+            });
+            spawnFx(jelly.root);
+            enforceObjectCap(registry, engine.world, render);
+            syncSelection();
+            updateCount();
+            return;
+          }
+        }
         const key = textureKey(request.id);
         registerTexture(render, key, texture);
-        const pos = spawnPosition(cw, ch, size.height);
         const body =
           createHullBody(pos.x, pos.y, size.width, size.height, key, texture) ??
           createImageBody(pos.x, pos.y, size.width, size.height, key, texture);
@@ -913,7 +1197,6 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
           textureKeys: [key],
           createdAt: engine.timing.timestamp,
         });
-        soundRef.current?.spawn();
         spawnFx(body);
         enforceObjectCap(registry, engine.world, render);
         syncSelection();
@@ -1037,6 +1320,8 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
     setGravityOn(true);
     setGravityDir('down');
     setGravityStrength(1);
+    engine.timing.timeScale = 1;
+    setSlowMo(false);
     if (runner) {
       runner.enabled = true;
       setPaused(false);
@@ -1048,6 +1333,7 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
       render.options.height || 600,
       materialRef.current,
       registry,
+      spawnAsRef.current,
       spawnFx,
     );
     updateCount();
@@ -1066,6 +1352,7 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
       render.options.height || 600,
       materialRef.current,
       registry,
+      spawnAsRef.current,
       spawnFx,
     );
     soundRef.current?.spawnBatch();
@@ -1086,10 +1373,10 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
     const origin = explosionOrigin(nonStaticBodies(engine), w, h, engine.gravity);
     if (explodeShatterRef.current && registryRef.current) {
       const registry = registryRef.current;
-      const solids = registry.list().filter((o) => o.kind === 'solid');
-      const perObj = Math.max(3, Math.min(14, Math.floor(120 / Math.max(1, solids.length))));
-      for (const obj of solids) {
-        shatterObject(
+      const objs = registry.list();
+      const perObj = Math.max(3, Math.min(14, Math.floor(120 / Math.max(1, objs.length))));
+      for (const obj of objs) {
+        crumbleObject(
           obj,
           {
             x: obj.root.position.x + (Math.random() - 0.5) * 30,
@@ -1138,7 +1425,7 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
       void btn.offsetWidth;
       btn.classList.add('physics-btn--punch');
     }
-  }, [shatterObject, updateCount]);
+  }, [crumbleObject, updateCount]);
 
   const handleMaterialChange = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
     const name = e.target.value as MaterialName;
@@ -1146,7 +1433,12 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
     setMaterial(name);
     materialRef.current = name;
     const sel = selectedBodyRef.current;
-    if (sel && !sel.isStatic) applyMaterial(sel, name);
+    if (sel) {
+      const obj = registryRef.current?.objectOf(sel);
+      for (const b of obj ? obj.bodies : [sel]) {
+        if (!b.isStatic) applyMaterial(b, name);
+      }
+    }
     soundRef.current?.impact(0.7, name);
   }, []);
 
@@ -1245,6 +1537,7 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
             </span>
             <span className="physics-status__chip">{gravityLabel}</span>
             <span className="physics-status__chip">Material: {MATERIALS[material].label}</span>
+            {spawnAs === 'jelly' && <span className="physics-status__chip">Spawn: Jelly</span>}
             {paused && <span className="physics-status__chip physics-status__chip--paused">Paused</span>}
             {slowMo && <span className="physics-status__chip physics-status__chip--slowmo">Slow-mo</span>}
           </div>
@@ -1407,6 +1700,24 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
           <Camera size={15} />
           <span>Snapshot</span>
         </button>
+        <div className="physics-spawnas" role="group" aria-label="Spawn as">
+          <span className="physics-spawnas__label">Spawn</span>
+          {(['solid', 'jelly'] as const).map((k) => (
+            <button
+              key={k}
+              type="button"
+              className={`physics-spawnas__btn${spawnAs === k ? ' is-active' : ''}`}
+              aria-pressed={spawnAs === k}
+              onClick={() => {
+                spawnAsRef.current = k;
+                setSpawnAs(k);
+                soundRef.current?.click();
+              }}
+            >
+              {k === 'solid' ? 'Solid' : 'Jelly'}
+            </button>
+          ))}
+        </div>
         <label className="physics-material" title="Material for new objects">
           <span className="physics-material__dot" style={{ background: MATERIALS[material].color }} />
           <span className="physics-material__label">Material</span>

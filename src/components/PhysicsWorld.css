@@ -500,3 +500,38 @@
   color: var(--accent-cyan);
   border-color: var(--accent-cyan);
 }
+
+/* --- Spawn-as segmented control --------------------------------------------- */
+
+.physics-spawnas {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 10px;
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--border);
+}
+
+.physics-spawnas__label {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  padding: 0 6px 0 4px;
+}
+
+.physics-spawnas__btn {
+  padding: 4px 10px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+}
+
+.physics-spawnas__btn.is-active {
+  color: var(--text);
+  background: rgba(34, 211, 238, 0.14);
+  border-color: var(--accent-cyan);
+}

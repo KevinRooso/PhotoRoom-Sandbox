@@ -50,8 +50,9 @@ function polyArea(poly: V[]): number {
   return a / 2;
 }
 
-/** Rasterize the parent's appearance in its local frame (origin = position). */
-function localTexture(body: Matter.Body, render: Matter.Render, local: V[], w: number, h: number): HTMLCanvasElement {
+/** Rasterize the parent's appearance in its local frame (origin = position).
+ *  Also used to turn showcase items into jelly textures. */
+export function localTexture(body: Matter.Body, render: Matter.Render, local: V[], w: number, h: number): HTMLCanvasElement {
   const c = document.createElement('canvas');
   c.width = Math.max(1, Math.ceil(w));
   c.height = Math.max(1, Math.ceil(h));
