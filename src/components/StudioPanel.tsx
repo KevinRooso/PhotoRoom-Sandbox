@@ -148,6 +148,11 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
   const storeRef = useRef<Awaited<ReturnType<typeof openLibrary>> | null>(null);
   const staggerTimersRef = useRef<number[]>([]);
   const confirmTimerRef = useRef<{ id: number | null }>({ id: null });
+  const libraryReadyRef = useRef<Promise<void> | null>(null);
+  const groupsRef = useRef<Group[]>([]);
+  useEffect(() => {
+    groupsRef.current = groups;
+  }, [groups]);
 
   const releasePendingOriginal = useCallback(() => {
     if (pendingOriginalUrlRef.current !== null) {
@@ -191,7 +196,7 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
       if (mountedRef.current) setPoseUnavailable(true);
     });
 
-    (async () => {
+    libraryReadyRef.current = (async () => {
       try {
         const store = await openLibrary();
         storeRef.current = store;
@@ -268,6 +273,7 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
       const validationError = validateFile(file);
       if (validationError) {
         setError(validationError);
+        setNotice(null);
         setProgress(INITIAL_PROGRESS);
         return;
       }
@@ -291,9 +297,12 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
 
         if (!mountedRef.current || requestSequenceRef.current !== requestId) return;
 
+        await libraryReadyRef.current;
+        if (!mountedRef.current || requestSequenceRef.current !== requestId) return;
+
         const existing = await store.findUpload(hash);
         if (existing) {
-          const existingGroup = groups.find((g) => g.id === hash);
+          const existingGroup = groupsRef.current.find((g) => g.id === hash);
           if (existingGroup && existingGroup.assetIds.length > 0) {
             releasePendingOriginal();
             selectItem(existingGroup.assetIds[0]);
@@ -301,6 +310,7 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
             setProgress(INITIAL_PROGRESS);
             return;
           }
+          await store.deleteUpload(hash);
         }
 
         const result = await segmentPeople(file, (nextProgress) => {
@@ -391,7 +401,7 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
         if (activeRequestRef.current === requestId) activeRequestRef.current = null;
       }
     },
-    [groups, releasePendingOriginal, selectItem],
+    [releasePendingOriginal, selectItem],
   );
 
   const openFilePicker = useCallback(() => {
@@ -564,6 +574,7 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
     } catch {
       /* keep UI consistent anyway */
     }
+    if (group.originalUrl) URL.revokeObjectURL(group.originalUrl);
     setGroups((current) => current.filter((g) => g.id !== group.id));
     setItems((current) => current.filter((i) => i.groupId !== group.id));
     setSelectedId((current) => (group.assetIds.includes(current ?? '') ? null : current));
@@ -795,6 +806,11 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
                           const crop = selectedGroup.crops[item.assetId];
                           if (!crop) return null;
                           const color = CROP_COLORS[index % CROP_COLORS.length];
+                          const fontSize = Math.max(16, selectedGroup.width / 28);
+                          const pad = fontSize * 0.3;
+                          const text = item.label || item.name;
+                          const labelW = text.length * fontSize * 0.6 + pad * 2;
+                          const labelH = fontSize + pad * 2;
                           return (
                             <g key={item.assetId}>
                               <rect
@@ -804,17 +820,25 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
                                 height={crop.height}
                                 fill="none"
                                 stroke={color}
-                                strokeWidth={Math.max(3, selectedGroup.width / 300)}
+                                strokeWidth={Math.max(3, selectedGroup.width / 200)}
                                 rx={8}
                               />
+                              <rect
+                                x={crop.x}
+                                y={crop.y}
+                                width={labelW}
+                                height={labelH}
+                                fill="rgb(0 0 0 / 60%)"
+                                rx={pad}
+                              />
                               <text
-                                x={crop.x + 8}
-                                y={crop.y + Math.max(20, selectedGroup.width / 40)}
+                                x={crop.x + pad}
+                                y={crop.y + pad + fontSize * 0.8}
                                 fill={color}
-                                fontSize={Math.max(16, selectedGroup.width / 45)}
+                                fontSize={fontSize}
                                 fontWeight={600}
                               >
-                                {item.label || item.name}
+                                {text}
                               </text>
                             </g>
                           );

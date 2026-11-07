@@ -27,6 +27,7 @@ export interface SegmentResult {
 const MODEL_PATH = '/models/pose_landmarker_lite.task';
 const ALPHA_THRESHOLD = 8;
 const MASK_THRESHOLD = 0.2;
+const LOW_MASK_THRESHOLD = 0.05;
 const BBOX_EXPAND = 0.08;
 const GRID_MAX = 1024;
 const MIN_PERSON_PART = 0.02;
@@ -639,9 +640,10 @@ export async function segmentPeople(
           if (grid[cell] !== LEFTOVER) continue;
           const nx = (gx + 0.5) / gw;
 
-          let bestPerson = -1;
-          let bestValue = MASK_THRESHOLD;
+          let maxPerson = -1;
+          let maxValue = 0;
           const candidates: number[] = [];
+          const noMaskCandidates: number[] = [];
 
           for (let p = 0; p < people.length; p += 1) {
             const person = people[p];
@@ -658,26 +660,22 @@ export async function segmentPeople(
               const mx = Math.min(person.maskWidth - 1, Math.floor(lx * person.maskWidth));
               const my = Math.min(person.maskHeight - 1, Math.floor(ly * person.maskHeight));
               const value = person.mask[my * person.maskWidth + mx];
-              if (value >= bestValue) {
-                bestValue = value;
-                bestPerson = p;
+              if (value > maxValue) {
+                maxValue = value;
+                maxPerson = p;
               }
             }
             const b = person.bbox;
             if (nx >= b.left && nx <= b.right && ny >= b.top && ny <= b.bottom) {
               candidates.push(p);
+              if (person.maskWidth === 0) noMaskCandidates.push(p);
             }
           }
 
-          if (bestPerson >= 0) {
-            grid[cell] = bestPerson;
-            continue;
-          }
-
-          if (candidates.length > 0) {
-            let nearest = candidates[0];
+          const nearestOf = (pool: number[]): number => {
+            let nearest = -1;
             let nearestDist = Infinity;
-            for (const p of candidates) {
+            for (const p of pool) {
               const dx = (people[p].torsoX - nx) * gw;
               const dy = (people[p].torsoY - ny) * gh;
               const dist = dx * dx + dy * dy;
@@ -686,7 +684,15 @@ export async function segmentPeople(
                 nearest = p;
               }
             }
-            grid[cell] = nearest;
+            return nearest;
+          };
+
+          if (maxValue >= MASK_THRESHOLD) {
+            grid[cell] = maxPerson;
+          } else if (maxValue >= LOW_MASK_THRESHOLD) {
+            grid[cell] = candidates.length > 0 ? nearestOf(candidates) : maxPerson;
+          } else if (noMaskCandidates.length > 0) {
+            grid[cell] = nearestOf(noMaskCandidates);
           }
         }
       }
