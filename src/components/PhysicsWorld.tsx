@@ -90,6 +90,7 @@ import {
 } from '../lib/physics/fx';
 import { createHullBody } from '../lib/physics/hull';
 import { createJelly, tintJellyTextures } from '../lib/physics/softbody';
+import { createRagdoll, createStickFigure, enforceJointLimits, enforcePinPositions, type RagdollJoint } from '../lib/physics/ragdoll';
 import { createRope, createSpringLink, drawRope, drawSpring } from '../lib/physics/ropes';
 import './PhysicsWorld.css';
 
@@ -115,7 +116,7 @@ const MOUSE_EVENTS: Array<[string, 'mousemove' | 'mousedown' | 'mouseup' | 'mous
 ];
 
 type ToolName = 'grab' | 'crumble' | 'freeze' | 'fire' | 'hang' | 'link' | 'blackhole';
-type SpawnKind = 'solid' | 'jelly';
+type SpawnKind = 'solid' | 'jelly' | 'ragdoll';
 
 const TOOLS: Array<{ id: ToolName; label: string; icon: React.ReactNode }> = [
   { id: 'grab', label: 'Grab', icon: <Hand size={16} /> },
@@ -145,6 +146,39 @@ interface Burning {
   voice: { stop(): void };
 }
 
+function addJelly(
+  engine: Matter.Engine,
+  registry: ObjectRegistry,
+  jelly: NonNullable<ReturnType<typeof createJelly>>,
+): void {
+  registry.add(engine.world, {
+    id: registry.nextId(),
+    kind: 'jelly',
+    root: jelly.root,
+    bodies: jelly.bodies,
+    constraints: jelly.constraints,
+    textureKeys: jelly.textureKeys,
+    createdAt: engine.timing.timestamp,
+  });
+}
+
+function addRagdoll(
+  engine: Matter.Engine,
+  registry: ObjectRegistry,
+  rd: NonNullable<ReturnType<typeof createRagdoll>>,
+): void {
+  registry.add(engine.world, {
+    id: registry.nextId(),
+    kind: 'ragdoll',
+    root: rd.root,
+    bodies: rd.bodies,
+    constraints: rd.constraints,
+    textureKeys: rd.textureKeys,
+    createdAt: engine.timing.timestamp,
+    joints: rd.joints,
+  });
+}
+
 function addShowcase(
   engine: Matter.Engine,
   render: Matter.Render,
@@ -155,6 +189,53 @@ function addShowcase(
   spawnAs: SpawnKind,
   spawnFx?: (body: Matter.Body, opts?: { sound?: boolean }) => void,
 ): void {
+  // stick figure: ragdoll in Ragdoll mode, jelly in Jelly mode, hull solid otherwise
+  {
+    const stick = createStickFigure();
+    const sx = w * (0.45 + Math.random() * 0.1);
+    const sy = 40;
+    if (spawnAs === 'ragdoll') {
+      const rd = createRagdoll({
+        x: sx,
+        y: sy + 60,
+        w: 110,
+        h: 200,
+        texture: stick.canvas,
+        pose: stick.pose,
+        render,
+        material,
+      });
+      if (rd) {
+        addRagdoll(engine, registry, rd);
+        spawnFx?.(rd.root, { sound: false });
+      }
+    } else if (spawnAs === 'jelly') {
+      const jelly = createJelly({ x: sx, y: sy + 60, w: 110, h: 200, texture: stick.canvas, render, material });
+      if (jelly) {
+        addJelly(engine, registry, jelly);
+        spawnFx?.(jelly.root, { sound: false });
+      }
+    } else {
+      const key = `physics-tex-stick-${Date.now()}`;
+      registerTexture(render, key, stick.canvas);
+      const body =
+        createHullBody(sx, sy + 60, 110, 200, key, stick.canvas) ??
+        Matter.Bodies.rectangle(sx, sy + 60, 110, 200, {
+          render: { sprite: { texture: key, xScale: 1, yScale: 1 } },
+        });
+      applyMaterial(body, material);
+      registry.add(engine.world, {
+        id: registry.nextId(),
+        kind: 'solid',
+        root: body,
+        bodies: [body],
+        constraints: [],
+        textureKeys: [key],
+        createdAt: engine.timing.timestamp,
+      });
+      spawnFx?.(body, { sound: false });
+    }
+  }
   for (const item of createTestObjects(w, h)) {
     if (spawnAs === 'jelly') {
       const body = item.body;
@@ -426,6 +507,7 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
     const h = stage.clientHeight || 600;
 
     const engine = createEngine();
+    engine.constraintIterations = 8;
     const render = Matter.Render.create({
       element: stage,
       engine,
@@ -514,6 +596,12 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
             });
             dustBursts.push(createDustBurst(c.x, c.y, 'ash'));
           }
+        }
+      }
+      for (const obj of registry.list()) {
+        if (obj.kind === 'ragdoll' && obj.joints) {
+          enforceJointLimits(obj.joints as RagdollJoint[]);
+          enforcePinPositions(obj.constraints);
         }
       }
       const hole = blackHoleRef.current;
@@ -1153,6 +1241,26 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
         const size = computeBodySize(request, img.naturalWidth, img.naturalHeight, cw, ch);
         const texture = rasterizeTexture(img, size.width, size.height);
         const pos = spawnPosition(cw, ch, size.height);
+        if (spawnAsRef.current === 'ragdoll') {
+          const rd = createRagdoll({
+            x: pos.x,
+            y: pos.y,
+            w: size.width,
+            h: size.height,
+            texture,
+            pose: request.pose,
+            render,
+            material: materialRef.current,
+          });
+          if (rd) {
+            addRagdoll(engine, registry, rd);
+            spawnFx(rd.root);
+            enforceObjectCap(registry, engine.world, render);
+            syncSelection();
+            updateCount();
+            return;
+          }
+        }
         if (spawnAsRef.current === 'jelly') {
           const jelly = createJelly({
             x: pos.x,
@@ -1537,7 +1645,11 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
             </span>
             <span className="physics-status__chip">{gravityLabel}</span>
             <span className="physics-status__chip">Material: {MATERIALS[material].label}</span>
-            {spawnAs === 'jelly' && <span className="physics-status__chip">Spawn: Jelly</span>}
+            {spawnAs !== 'solid' && (
+              <span className="physics-status__chip">
+                Spawn: {spawnAs === 'jelly' ? 'Jelly' : 'Ragdoll'}
+              </span>
+            )}
             {paused && <span className="physics-status__chip physics-status__chip--paused">Paused</span>}
             {slowMo && <span className="physics-status__chip physics-status__chip--slowmo">Slow-mo</span>}
           </div>
@@ -1702,7 +1814,7 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
         </button>
         <div className="physics-spawnas" role="group" aria-label="Spawn as">
           <span className="physics-spawnas__label">Spawn</span>
-          {(['solid', 'jelly'] as const).map((k) => (
+          {(['solid', 'jelly', 'ragdoll'] as const).map((k) => (
             <button
               key={k}
               type="button"
@@ -1714,7 +1826,7 @@ export default function PhysicsWorld({ spawnRequests }: PhysicsWorldProps) {
                 soundRef.current?.click();
               }}
             >
-              {k === 'solid' ? 'Solid' : 'Jelly'}
+              {k === 'solid' ? 'Solid' : k === 'jelly' ? 'Jelly' : 'Ragdoll'}
             </button>
           ))}
         </div>
