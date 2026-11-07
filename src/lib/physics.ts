@@ -9,6 +9,8 @@ import {
 export const MAX_SPEED = 40;
 export const MAX_BODIES = 60;
 export const WALL_THICKNESS = 400;
+/** Wall span: oversized so repositioning alone covers any canvas size. */
+export const WALL_LENGTH = 20000;
 export const TEXTURE_MAX_PX = 512;
 export const MIN_BODY_SIDE = 24;
 export const GRAVITY_MAX = 3;
@@ -45,12 +47,13 @@ export function applyGravity(
 /** Floor, ceiling and side walls just outside the visible area. */
 export function createWalls(w: number, h: number): Matter.Body[] {
   const t = WALL_THICKNESS;
+  const L = WALL_LENGTH;
   const opts: Matter.IChamferableBodyDefinition = { isStatic: true, render: { visible: false } };
   return [
-    Matter.Bodies.rectangle(w / 2, h + t / 2, w + 2 * t, t, opts), // floor
-    Matter.Bodies.rectangle(w / 2, -t / 2, w + 2 * t, t, opts), // ceiling
-    Matter.Bodies.rectangle(-t / 2, h / 2, t, h + 2 * t, opts), // left
-    Matter.Bodies.rectangle(w + t / 2, h / 2, t, h + 2 * t, opts), // right
+    Matter.Bodies.rectangle(w / 2, h + t / 2, L, t, opts), // floor
+    Matter.Bodies.rectangle(w / 2, -t / 2, L, t, opts), // ceiling
+    Matter.Bodies.rectangle(-t / 2, h / 2, t, L, opts), // left
+    Matter.Bodies.rectangle(w + t / 2, h / 2, t, L, opts), // right
   ];
 }
 
@@ -61,7 +64,6 @@ export function updateWalls(walls: Matter.Body[], w: number, h: number): void {
   Matter.Body.setPosition(walls[1], { x: w / 2, y: -t / 2 });
   Matter.Body.setPosition(walls[2], { x: -t / 2, y: h / 2 });
   Matter.Body.setPosition(walls[3], { x: w + t / 2, y: h / 2 });
-  // Widths keep a 2 * WALL_THICKNESS overhang, so they still cover the edges on shrink.
 }
 
 export interface BodySize {
@@ -94,18 +96,19 @@ export function computeBodySize(
 }
 
 /**
- * Rasterize a loaded image into an offscreen canvas whose longest side is
- * min(longestSide * devicePixelRatio, TEXTURE_MAX_PX).
+ * Rasterize a loaded image into an offscreen canvas sized from the target
+ * body's aspect: longest side = min(longest * devicePixelRatio, TEXTURE_MAX_PX).
+ * Sizing from bodyW/bodyH (not naturalWidth) means SVGs reporting a 0 natural
+ * size still draw correctly.
  */
-export function rasterizeTexture(img: HTMLImageElement, longestSide: number): HTMLCanvasElement {
+export function rasterizeTexture(img: HTMLImageElement, bodyW: number, bodyH: number): HTMLCanvasElement {
   const dpr = window.devicePixelRatio || 1;
-  const target = Math.max(1, Math.min(Math.round(longestSide * dpr), TEXTURE_MAX_PX));
-  const nw = img.naturalWidth || 1;
-  const nh = img.naturalHeight || 1;
-  const scale = target / Math.max(nw, nh);
+  const longest = Math.max(bodyW, bodyH, 1);
+  const target = Math.max(1, Math.min(Math.round(longest * dpr), TEXTURE_MAX_PX));
+  const scale = target / longest;
   const canvas = document.createElement('canvas');
-  canvas.width = Math.max(1, Math.round(nw * scale));
-  canvas.height = Math.max(1, Math.round(nh * scale));
+  canvas.width = Math.max(1, Math.round(bodyW * scale));
+  canvas.height = Math.max(1, Math.round(bodyH * scale));
   const ctx = canvas.getContext('2d');
   if (ctx) ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
   return canvas;
@@ -216,13 +219,19 @@ export function limitVelocity(bodies: Matter.Body[], max: number): void {
   }
 }
 
-/** Push bodies that ended up outside the canvas back inside and stop them. */
+/**
+ * Push bodies that ended up outside the canvas back inside and stop them.
+ * Centres are clamped by the body's half-extents (from `body.bounds`); a body
+ * larger than the canvas on an axis is centred on that axis.
+ */
 export function clampBodiesInside(bodies: Matter.Body[], w: number, h: number): void {
   for (const body of bodies) {
     if (body.isStatic) continue;
+    const hw = (body.bounds.max.x - body.bounds.min.x) / 2;
+    const hh = (body.bounds.max.y - body.bounds.min.y) / 2;
     const p = body.position;
-    const nx = Math.max(0, Math.min(w, p.x));
-    const ny = Math.max(0, Math.min(h, p.y));
+    const nx = hw * 2 >= w ? w / 2 : Math.max(hw, Math.min(w - hw, p.x));
+    const ny = hh * 2 >= h ? h / 2 : Math.max(hh, Math.min(h - hh, p.y));
     if (nx !== p.x || ny !== p.y) {
       Matter.Body.setPosition(body, { x: nx, y: ny });
       Matter.Body.setVelocity(body, { x: 0, y: 0 });
@@ -313,6 +322,14 @@ function drawStripedBall(size: number): HTMLCanvasElement {
 
 const SHOWCASE_COLORS = ['#8b5cf6', '#22d3ee', '#f43f5e', '#f59e0b', '#a3e635'];
 
+// Unique texture key per spawned sprite — a shared key would break every other
+// sprite when `releaseBodyTexture` deletes it for one evicted body.
+let showcaseTexSeq = 0;
+function nextShowcaseKey(name: string): string {
+  showcaseTexSeq += 1;
+  return `physics-tex-showcase-${name}-${showcaseTexSeq}`;
+}
+
 /**
  * ~8 mixed test objects: Matter primitives in theme colours plus 2
  * procedurally-drawn canvas textures rendered as sprites.
@@ -375,7 +392,7 @@ export function createTestObjects(w: number, h: number, count = 8): ShowcaseItem
   // 2 procedural-texture sprites
   const crateCanvas = drawCrate(96);
   p = spawn(0.4);
-  const crateKey = 'physics-tex-showcase-crate';
+  const crateKey = nextShowcaseKey('crate');
   items.push({
     body: Matter.Bodies.rectangle(p.x, p.y, 64, 64, {
       chamfer: { radius: 6 },
@@ -388,7 +405,7 @@ export function createTestObjects(w: number, h: number, count = 8): ShowcaseItem
 
   const ballCanvas = drawStripedBall(96);
   p = spawn(0.65);
-  const ballKey = 'physics-tex-showcase-ball';
+  const ballKey = nextShowcaseKey('ball');
   items.push({
     body: Matter.Bodies.circle(p.x, p.y, 34, {
       restitution: 0.6,
@@ -423,4 +440,72 @@ export function resizeRender(render: Matter.Render, w: number, h: number): void 
   render.canvas.height = Math.round(h * pr);
   render.canvas.style.width = `${w}px`;
   render.canvas.style.height = `${h}px`;
+}
+
+// --- Materials ---------------------------------------------------------------
+
+export type MaterialName = 'normal' | 'rubber' | 'metal' | 'feather';
+
+export const MATERIALS: Record<
+  MaterialName,
+  { label: string; restitution: number; friction: number; frictionAir: number; density: number; color: string }
+> = {
+  normal: { label: 'Normal', restitution: 0.35, friction: 0.4, frictionAir: 0.005, density: 0.001, color: '#8a90a6' },
+  rubber: { label: 'Rubber', restitution: 0.9, friction: 0.8, frictionAir: 0.004, density: 0.0012, color: '#f43f5e' },
+  metal: { label: 'Metal', restitution: 0.1, friction: 0.25, frictionAir: 0.002, density: 0.006, color: '#cbd5e1' },
+  feather: { label: 'Feather', restitution: 0.25, friction: 0.6, frictionAir: 0.07, density: 0.0003, color: '#a3e635' },
+};
+
+export function applyMaterial(body: Matter.Body, name: MaterialName): void {
+  const m = MATERIALS[name];
+  body.restitution = m.restitution;
+  body.friction = m.friction;
+  body.frictionAir = m.frictionAir;
+  Matter.Body.setDensity(body, m.density);
+  body.plugin = body.plugin || {};
+  (body.plugin as Record<string, unknown>).material = name;
+}
+
+// --- Black hole ----------------------------------------------------------------
+
+export interface BlackHole {
+  x: number;
+  y: number;
+  /** engine.timing.timestamp at placement — freezes with the engine when paused */
+  bornAt: number;
+}
+
+export const BLACK_HOLE_LIFETIME = 4000;
+export const BLACK_HOLE_G = 0.0012;
+
+export function blackHoleRadius(canvasW: number, canvasH: number): number {
+  return Math.max(180, Math.min(420, 0.45 * Math.min(canvasW, canvasH)));
+}
+
+/**
+ * Pull bodies toward the hole: magnitude G·mass·(1 − d/R), ~30% tangential
+ * swirl, strong velocity damping inside ~40px so bodies cluster instead of
+ * slingshotting. The global velocity cap still applies.
+ */
+export function applyBlackHole(bodies: Matter.Body[], hole: BlackHole, R: number, G = BLACK_HOLE_G): void {
+  for (const body of bodies) {
+    if (body.isStatic) continue;
+    const dx = hole.x - body.position.x;
+    const dy = hole.y - body.position.y;
+    const d = Math.max(20, Math.hypot(dx, dy));
+    if (d > R) continue;
+    const mag = G * body.mass * (1 - d / R);
+    const ux = dx / d;
+    const uy = dy / d;
+    // tangential unit vector for swirl
+    const tx = -uy;
+    const ty = ux;
+    Matter.Body.applyForce(body, body.position, {
+      x: ux * mag + tx * mag * 0.3,
+      y: uy * mag + ty * mag * 0.3,
+    });
+    if (d < 40) {
+      Matter.Body.setVelocity(body, { x: body.velocity.x * 0.92, y: body.velocity.y * 0.92 });
+    }
+  }
 }

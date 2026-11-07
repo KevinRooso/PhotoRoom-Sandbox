@@ -7,6 +7,7 @@
   background: var(--bg);
   color: var(--text);
   overflow: hidden;
+  container-type: inline-size;
 }
 
 /* --- Stage --------------------------------------------------------------- */
@@ -25,7 +26,9 @@
 
 .physics-stage canvas {
   display: block;
-  position: relative;
+  position: absolute;
+  top: 0;
+  left: 0;
   z-index: 1;
 }
 
@@ -64,13 +67,27 @@
   }
 }
 
-/* --- Floating status bar -------------------------------------------------- */
+/* --- Top overlay row: status (left) + gravity panel (right) ---------------- */
 
-.physics-status {
+.physics-overlay {
   position: absolute;
   top: 10px;
   left: 10px;
+  right: 10px;
   z-index: 3;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.physics-overlay > * {
+  pointer-events: auto;
+}
+
+.physics-status {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -106,10 +123,6 @@
 /* --- Gravity panel -------------------------------------------------------- */
 
 .physics-gravity {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  z-index: 3;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -246,6 +259,22 @@
   to { opacity: 0; transform: scale(1.6); }
 }
 
+/* --- Snapshot flash ---------------------------------------------------------- */
+
+.physics-snapflash {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  pointer-events: none;
+  background: rgba(255, 255, 255, 0.55);
+  animation: physics-snapflash 0.35s ease-out forwards;
+}
+
+@keyframes physics-snapflash {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
 /* --- Toolbar --------------------------------------------------------------- */
 
 .physics-toolbar {
@@ -280,6 +309,48 @@
   transform: scale(0.97);
 }
 
+.physics-btn.is-armed {
+  color: var(--accent-cyan);
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 10px rgba(34, 211, 238, 0.45);
+}
+
+/* --- Material select --------------------------------------------------------- */
+
+.physics-material {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.physics-material__dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.physics-material select {
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  outline: none;
+}
+
+.physics-material select option {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
 .physics-btn--explode {
   margin-left: auto;
   padding: 10px 22px;
@@ -298,13 +369,17 @@
   filter: brightness(1.1);
 }
 
-@media (max-width: 640px) {
-  .physics-btn span {
+@container (max-width: 620px) {
+  .physics-btn:not(.physics-btn--explode) span {
     display: none;
   }
 
-  .physics-btn--explode span {
-    display: inline;
+  .physics-btn:not(.physics-btn--explode) {
+    padding: 8px 10px;
+  }
+
+  .physics-material__label {
+    display: none;
   }
 
   .physics-btn--explode {
