@@ -84,8 +84,15 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mountedRef = useRef(false);
+  const pendingOriginalUrlRef = useRef<string | null>(null);
   const requestSequenceRef = useRef(0);
   const loadingDemosRef = useRef(false);
+
+  const releasePendingOriginal = useCallback(() => {
+    const pendingOriginalUrl = pendingOriginalUrlRef.current;
+    if (pendingOriginalUrl !== null) URL.revokeObjectURL(pendingOriginalUrl);
+    pendingOriginalUrlRef.current = null;
+  }, []);
 
   const selectedItem = items.find((item) => item.assetId === selectedId) ?? null;
   const currentPreviewUrl = pendingPreview
@@ -105,8 +112,9 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
     return () => {
       mountedRef.current = false;
       requestSequenceRef.current += 1;
+      releasePendingOriginal();
     };
-  }, []);
+  }, [releasePendingOriginal]);
 
   const handleFile = useCallback(async (file: File) => {
     const requestId = ++requestSequenceRef.current;
@@ -118,7 +126,9 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
       return;
     }
 
+    releasePendingOriginal();
     const originalUrl = URL.createObjectURL(file);
+    pendingOriginalUrlRef.current = originalUrl;
     setError(null);
     setShowOriginal(true);
     setSelectedId(null);
@@ -136,8 +146,12 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
         }
       });
 
-      if (!mountedRef.current || requestSequenceRef.current !== requestId) return;
+      if (!mountedRef.current || requestSequenceRef.current !== requestId) {
+        URL.revokeObjectURL(result.url);
+        return;
+      }
 
+      pendingOriginalUrlRef.current = null;
       const item: LibraryItem = {
         assetId: newId(),
         name: file.name,
@@ -152,6 +166,7 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
       setPendingPreview(null);
       setShowOriginal(false);
       setError(null);
+      setModelUnavailable(false);
       setProgress({ phase: 'done', ratio: 1, label: 'Background removed' });
     } catch (removalError) {
       if (!mountedRef.current || requestSequenceRef.current !== requestId) return;
@@ -167,7 +182,7 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
         label: 'Background removal failed',
       });
     }
-  }, []);
+  }, [releasePendingOriginal]);
 
   const openFilePicker = useCallback(() => {
     fileInputRef.current?.click();
@@ -240,6 +255,8 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
 
       if (!mountedRef.current) return;
 
+      requestSequenceRef.current += 1;
+      releasePendingOriginal();
       setItems((currentItems) => {
         const existingIds = new Set(currentItems.map((item) => item.assetId));
         return [...currentItems, ...demoItems.filter((item) => !existingIds.has(item.assetId))];
@@ -489,6 +506,8 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
                   aria-label={`Select ${item.name}`}
                   aria-pressed={selectedId === item.assetId}
                   onClick={() => {
+                    requestSequenceRef.current += 1;
+                    releasePendingOriginal();
                     setSelectedId(item.assetId);
                     setProgress(clearFinishedProgress);
                     setPendingPreview(null);

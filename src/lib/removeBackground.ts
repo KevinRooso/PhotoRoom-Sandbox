@@ -84,7 +84,10 @@ export function validateFile(file: File): string | null {
 }
 
 export function preloadModel(): Promise<void> {
-  modelPreloadPromise ??= preload(sharedConfig);
+  modelPreloadPromise ??= preload(sharedConfig).catch((error) => {
+    modelPreloadPromise = undefined;
+    throw error;
+  });
   return modelPreloadPromise;
 }
 
