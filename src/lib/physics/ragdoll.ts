@@ -260,7 +260,9 @@ export function createRagdoll(opts: {
         pointA: { x: joint.x - a.position.x, y: joint.y - a.position.y },
         pointB: { x: joint.x - b.position.x, y: joint.y - b.position.y },
         length: 0,
-        stiffness: 1,
+        // stiffness 1 pins overshoot and oscillate in Matter 0.20 (measured
+        // ~25px torso jitter); 0.7 settles to sub-pixel motion
+        stiffness: 0.7,
         damping: 0.1,
         render: { visible: false },
       }),
