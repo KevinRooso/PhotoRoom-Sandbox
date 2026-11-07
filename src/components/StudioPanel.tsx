@@ -86,6 +86,7 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
   const mountedRef = useRef(false);
   const pendingOriginalUrlRef = useRef<string | null>(null);
   const requestSequenceRef = useRef(0);
+  const activeRequestRef = useRef<number | null>(null);
   const loadingDemosRef = useRef(false);
 
   const releasePendingOriginal = useCallback(() => {
@@ -126,6 +127,7 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
       return;
     }
 
+    activeRequestRef.current = requestId;
     releasePendingOriginal();
     const originalUrl = URL.createObjectURL(file);
     pendingOriginalUrlRef.current = originalUrl;
@@ -181,6 +183,10 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
         ratio: 0,
         label: 'Background removal failed',
       });
+    } finally {
+      if (activeRequestRef.current === requestId) {
+        activeRequestRef.current = null;
+      }
     }
   }, [releasePendingOriginal]);
 
@@ -255,8 +261,7 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
 
       if (!mountedRef.current) return;
 
-      requestSequenceRef.current += 1;
-      releasePendingOriginal();
+      if (activeRequestRef.current === null) releasePendingOriginal();
       setItems((currentItems) => {
         const existingIds = new Set(currentItems.map((item) => item.assetId));
         return [...currentItems, ...demoItems.filter((item) => !existingIds.has(item.assetId))];
@@ -506,8 +511,7 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
                   aria-label={`Select ${item.name}`}
                   aria-pressed={selectedId === item.assetId}
                   onClick={() => {
-                    requestSequenceRef.current += 1;
-                    releasePendingOriginal();
+                    if (activeRequestRef.current === null) releasePendingOriginal();
                     setSelectedId(item.assetId);
                     setProgress(clearFinishedProgress);
                     setPendingPreview(null);
