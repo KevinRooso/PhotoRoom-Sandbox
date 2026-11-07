@@ -1,0 +1,445 @@
+.physics {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg);
+  color: var(--text);
+  overflow: hidden;
+  container-type: inline-size;
+}
+
+/* --- Stage --------------------------------------------------------------- */
+
+.physics-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  background:
+    linear-gradient(rgba(139, 92, 246, 0.05), rgba(34, 211, 238, 0.03)),
+    repeating-linear-gradient(0deg, rgba(230, 232, 240, 0.045) 0 1px, transparent 1px 40px),
+    repeating-linear-gradient(90deg, rgba(230, 232, 240, 0.045) 0 1px, transparent 1px 40px),
+    var(--bg);
+}
+
+.physics-stage canvas {
+  display: block;
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 1;
+}
+
+/* subtle floor glow line */
+.physics-stage::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  z-index: 2;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent, var(--accent-cyan), var(--accent-purple), transparent);
+  opacity: 0.7;
+  box-shadow: 0 -2px 18px rgba(34, 211, 238, 0.35);
+}
+
+.physics-stage--shake {
+  animation: physics-shake 0.65s cubic-bezier(0.36, 0.07, 0.19, 0.97);
+}
+
+@keyframes physics-shake {
+  0%, 100% { transform: translate(0, 0) rotate(0deg); }
+  10% { transform: translate(-12px, 6px) rotate(-0.8deg); }
+  22% { transform: translate(10px, -8px) rotate(0.7deg); }
+  34% { transform: translate(-8px, -6px) rotate(-0.6deg); }
+  48% { transform: translate(7px, 5px) rotate(0.5deg); }
+  62% { transform: translate(-5px, 4px) rotate(-0.4deg); }
+  76% { transform: translate(4px, -3px) rotate(0.3deg); }
+  88% { transform: translate(-2px, 2px) rotate(-0.15deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .physics-stage--shake {
+    animation: none;
+  }
+
+  .physics-snapflash {
+    animation: none;
+    display: none;
+  }
+}
+
+/* --- Top overlay row: status (left) + gravity panel (right) ---------------- */
+
+.physics-overlay {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  right: 10px;
+  z-index: 3;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.physics-overlay > * {
+  pointer-events: auto;
+}
+
+.physics-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  pointer-events: none;
+}
+
+.physics-status__title {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: rgba(19, 23, 38, 0.85);
+  border: 1px solid var(--border);
+}
+
+.physics-status__chip {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: rgba(19, 23, 38, 0.85);
+  border: 1px solid var(--border);
+}
+
+.physics-status__chip--paused {
+  color: var(--danger);
+  border-color: var(--danger);
+  font-weight: 700;
+}
+
+/* --- Gravity panel -------------------------------------------------------- */
+
+.physics-gravity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: rgba(19, 23, 38, 0.9);
+  border: 1px solid var(--border);
+}
+
+.physics-gravity__toggle {
+  padding: 4px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.physics-gravity__toggle.is-on {
+  color: var(--accent-cyan);
+  border-color: var(--accent-cyan);
+}
+
+.physics-gravity__slider {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  min-width: 110px;
+}
+
+.physics-gravity__slider input {
+  width: 70px;
+  accent-color: var(--accent-purple);
+}
+
+.physics-gravity__dpad {
+  display: grid;
+  grid-template-columns: repeat(4, 26px);
+  gap: 4px;
+}
+
+.physics-gravity__dpad button {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.physics-gravity__dpad button:hover {
+  color: var(--text);
+}
+
+.physics-gravity__dpad button.is-active {
+  color: var(--accent-purple);
+  border-color: var(--accent-purple);
+  box-shadow: 0 0 8px rgba(139, 92, 246, 0.4);
+}
+
+/* --- Hint ----------------------------------------------------------------- */
+
+.physics-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  z-index: 3;
+  pointer-events: none;
+  font-size: 12.5px;
+  color: var(--muted);
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: rgba(19, 23, 38, 0.85);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+/* --- Explosion FX --------------------------------------------------------- */
+
+/* scorch mark sits behind the canvas (canvas is z-index 1) */
+.physics-scorch {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 220px;
+  height: 220px;
+  margin: -110px 0 0 -110px;
+  z-index: 0;
+  pointer-events: none;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle,
+    rgba(10, 8, 16, 0.85) 0%,
+    rgba(20, 14, 30, 0.55) 45%,
+    rgba(244, 63, 94, 0.18) 62%,
+    transparent 72%
+  );
+  animation: physics-scorch 2.5s ease-out forwards;
+}
+
+@keyframes physics-scorch {
+  from { opacity: 1; transform: scale(0.5); }
+  20% { opacity: 1; transform: scale(1); }
+  to { opacity: 0; transform: scale(1.05); }
+}
+
+.physics-fx {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+}
+
+.physics-fx__blast {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(
+    circle at var(--fx-x, 50%) var(--fx-y, 50%),
+    rgba(255, 244, 214, 0.9) 0%,
+    rgba(244, 63, 94, 0.45) 28%,
+    rgba(244, 63, 94, 0) 60%
+  );
+  animation: physics-blast 0.35s ease-out forwards;
+}
+
+@keyframes physics-blast {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+.physics-fx__boom {
+  position: absolute;
+  left: var(--boom-x, 50%);
+  top: var(--boom-y, 50%);
+  transform: translate(-50%, -50%) rotate(var(--boom-rot, 0deg));
+  font-size: clamp(40px, 9cqw, 96px);
+  font-weight: 900;
+  letter-spacing: 0.02em;
+  background: linear-gradient(135deg, #fde047, #f59e0b 55%, var(--danger));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  filter: drop-shadow(0 0 18px rgba(245, 158, 11, 0.7));
+  animation: physics-boom 0.75s cubic-bezier(0.2, 1.4, 0.4, 1) forwards;
+}
+
+@keyframes physics-boom {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, -50%) rotate(var(--boom-rot, 0deg)) scale(0.2);
+  }
+  25% {
+    opacity: 1;
+    transform: translate(-50%, -50%) rotate(var(--boom-rot, 0deg)) scale(1.25);
+  }
+  45% {
+    transform: translate(-50%, -50%) rotate(var(--boom-rot, 0deg)) scale(1);
+  }
+  75% {
+    opacity: 1;
+    transform: translate(-50%, -50%) rotate(var(--boom-rot, 0deg)) scale(1.05);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -50%) rotate(var(--boom-rot, 0deg)) scale(1.3);
+  }
+}
+
+/* --- Snapshot flash ---------------------------------------------------------- */
+
+.physics-snapflash {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  pointer-events: none;
+  background: rgba(255, 255, 255, 0.55);
+  animation: physics-snapflash 0.35s ease-out forwards;
+}
+
+@keyframes physics-snapflash {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+/* --- Toolbar --------------------------------------------------------------- */
+
+.physics-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+}
+
+.physics-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 13px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+  transition: border-color 0.15s, transform 0.1s;
+}
+
+.physics-btn:hover {
+  border-color: var(--accent-purple);
+}
+
+.physics-btn:active {
+  transform: scale(0.97);
+}
+
+.physics-btn.is-armed {
+  color: var(--accent-cyan);
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 10px rgba(34, 211, 238, 0.45);
+}
+
+/* --- Material select --------------------------------------------------------- */
+
+.physics-material {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.physics-material__dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.physics-material select {
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  outline: none;
+}
+
+.physics-material select option {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.physics-btn--explode {
+  margin-left: auto;
+  padding: 10px 22px;
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: #fff;
+  border: none;
+  border-radius: 12px;
+  background: linear-gradient(135deg, var(--danger), #f59e0b);
+  box-shadow: 0 0 16px rgba(244, 63, 94, 0.45);
+}
+
+.physics-btn--explode:hover {
+  box-shadow: 0 0 24px rgba(244, 63, 94, 0.7);
+  filter: brightness(1.1);
+}
+
+.physics-btn--punch {
+  animation: physics-punch 0.28s ease-out;
+}
+
+@keyframes physics-punch {
+  0% { transform: scale(1); }
+  30% { transform: scale(0.86); }
+  60% { transform: scale(1.08); }
+  100% { transform: scale(1); }
+}
+
+@container (max-width: 620px) {
+  .physics-btn:not(.physics-btn--explode) span {
+    display: none;
+  }
+
+  .physics-btn:not(.physics-btn--explode) {
+    padding: 8px 10px;
+  }
+
+  .physics-material__label {
+    display: none;
+  }
+
+  .physics-btn--explode {
+    margin-left: 0;
+  }
+}
