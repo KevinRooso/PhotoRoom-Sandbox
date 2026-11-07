@@ -52,6 +52,9 @@ const INITIAL_PROGRESS: RemovalProgress = {
   label: '',
 };
 
+const clearFinishedProgress = (current: RemovalProgress): RemovalProgress =>
+  current.phase === 'done' || current.phase === 'error' ? INITIAL_PROGRESS : current;
+
 const DEMO_ITEMS = [
   { assetId: 'demo-rocket', name: 'Rocket', url: '/demo/rocket.svg' },
   { assetId: 'demo-duck', name: 'Rubber Duck', url: '/demo/duck.svg' },
@@ -242,6 +245,7 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
         return [...currentItems, ...demoItems.filter((item) => !existingIds.has(item.assetId))];
       });
       setSelectedId(demoItems[0].assetId);
+      setProgress(clearFinishedProgress);
       setPendingPreview(null);
       setShowOriginal(false);
       demoItems.forEach(spawnItem);
@@ -265,7 +269,10 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
     const nameWithoutExtension = selectedItem.name.replace(/\.[^.]+$/, '');
     const anchor = document.createElement('a');
     anchor.href = selectedItem.cutoutUrl;
-    anchor.download = `${nameWithoutExtension}-cutout.png`;
+    const extension = selectedItem.source === 'demo'
+      ? selectedItem.cutoutUrl.split('.').pop() ?? 'svg'
+      : 'png';
+    anchor.download = `${nameWithoutExtension}-cutout.${extension}`;
     anchor.click();
   };
 
@@ -483,6 +490,7 @@ export default function StudioPanel({ onSpawn }: StudioPanelProps) {
                   aria-pressed={selectedId === item.assetId}
                   onClick={() => {
                     setSelectedId(item.assetId);
+                    setProgress(clearFinishedProgress);
                     setPendingPreview(null);
                     setShowOriginal(false);
                     setError(null);
