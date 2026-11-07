@@ -183,23 +183,6 @@ export function nonStaticBodies(engine: Matter.Engine): Matter.Body[] {
   return Matter.Composite.allBodies(engine.world).filter((b) => !b.isStatic);
 }
 
-/** Remove the oldest non-static bodies (and their textures) beyond the cap. */
-export function enforceBodyCap(engine: Matter.Engine, render: Matter.Render): void {
-  const bodies = nonStaticBodies(engine);
-  const excess = bodies.length - MAX_BODIES;
-  for (let i = 0; i < excess; i++) {
-    releaseBodyTexture(render, bodies[i]);
-    Matter.Composite.remove(engine.world, bodies[i]);
-  }
-}
-
-export function clearBodies(engine: Matter.Engine, render: Matter.Render): void {
-  for (const body of nonStaticBodies(engine)) {
-    releaseBodyTexture(render, body);
-    Matter.Composite.remove(engine.world, body);
-  }
-}
-
 export function limitVelocity(bodies: Matter.Body[], max: number): void {
   for (const body of bodies) {
     const speed = body.speed;
@@ -609,6 +592,7 @@ export interface SoundEngine {
   snapshot(): void;
   blackHoleStart(): void;
   blackHoleStop(): void;
+  crack(intensity: number): void;
   debug(): { ctx: AudioContext | null; output: AudioNode | null; stats: Record<string, number> };
   dispose(): void;
 }
@@ -1172,6 +1156,41 @@ export function createSoundEngine(initialMuted: boolean): SoundEngine {
           }
         }
       };
+    },
+
+    crack(intensity: number) {
+      if (!ready()) return;
+      bump('crack');
+      const t = now();
+      const g = Math.max(0.15, Math.min(1, intensity));
+      // sharp high-passed noise snap
+      {
+        const src = noise();
+        const hp = ctx!.createBiquadFilter();
+        hp.type = 'highpass';
+        hp.frequency.value = 1800;
+        const gn = gainEnv(0.5 * g, 0.001, 0.09, t);
+        chain([src, hp, gn], t, t + 0.12);
+      }
+      // tiny crackle clicks
+      for (let i = 0; i < 3; i++) {
+        const dt = 0.04 + i * 0.05 + Math.random() * 0.02;
+        const src = noise();
+        const bp = ctx!.createBiquadFilter();
+        bp.type = 'bandpass';
+        bp.frequency.value = 2400 + Math.random() * 1800;
+        bp.Q.value = 2;
+        const gn = gainEnv(0.2 * g * (1 - i * 0.2), 0.001, 0.03, t + dt);
+        chain([src, bp, gn], t + dt, t + dt + 0.05);
+      }
+      // low thump
+      {
+        const o = osc('sine', 110);
+        o.frequency.setValueAtTime(110, t);
+        o.frequency.exponentialRampToValueAtTime(55, t + 0.12);
+        const gn = gainEnv(0.4 * g, 0.003, 0.15, t);
+        chain([o, gn], t, t + 0.18);
+      }
     },
 
     debug() {

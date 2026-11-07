@@ -443,3 +443,44 @@
     margin-left: 0;
   }
 }
+
+/* --- Tool rail (left edge inside the stage) --------------------------------- */
+
+.physics-tools {
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 5px;
+  border-radius: 12px;
+  background: var(--glass-bg, rgba(19, 23, 38, 0.85));
+  backdrop-filter: var(--glass-blur, blur(8px));
+  border: 1px solid var(--border);
+}
+
+.physics-tools__btn {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.physics-tools__btn:hover {
+  color: var(--text);
+  border-color: var(--border);
+}
+
+.physics-tools__btn.is-active {
+  color: var(--accent-cyan);
+  border-color: var(--accent-cyan);
+  background: rgba(34, 211, 238, 0.12);
+}
